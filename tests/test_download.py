@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from mlflow.tracking import MlflowClient
 
-from mlflow_pull import PARENT_RUN_TAG, download_experiment, download_run_tree
+from mlflow_pull import PARENT_RUN_TAG, download_experiment, download_run_tree, main
 
 
 @pytest.fixture
@@ -67,3 +67,13 @@ def test_experiment_downloads_every_top_level_run(
     assert sorted(f.rsplit("/", 1)[1] for f in _files(out)) == [
         "a.txt", "b.txt", "deep.txt", "g.txt", "o.txt", "top.txt",
     ]
+
+
+def test_out_option_follows_subcommand(
+    client: MlflowClient, tree: dict[str, str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", client.tracking_uri)
+    out = tmp_path / "cli-out"
+    main(["run", tree["other"], "-o", str(out)])
+
+    assert sorted(f.rsplit("/", 1)[1] for f in _files(out)) == ["o.txt"]

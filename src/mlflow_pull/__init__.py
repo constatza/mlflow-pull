@@ -61,11 +61,16 @@ def download_experiment(client: MlflowClient, name_or_id: str, out: Path) -> int
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(prog="mlflow-pull", description=__doc__)
-    parser.add_argument("-o", "--out", type=Path, default=DEFAULT_OUT, help="destination directory")
+    parser = argparse.ArgumentParser(prog="mlpull", description=__doc__)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("-o", "--out", type=Path, default=DEFAULT_OUT, help="destination directory")
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("run", help="a run and all its nested runs").add_argument("run_id")
-    sub.add_parser("experiment", help="every run of an experiment").add_argument("experiment")
+    sub.add_parser("run", parents=[common], help="a run and all its nested runs").add_argument(
+        "run_id"
+    )
+    sub.add_parser("experiment", parents=[common], help="every run of an experiment").add_argument(
+        "experiment"
+    )
     args = parser.parse_args(argv)
 
     client = MlflowClient()
