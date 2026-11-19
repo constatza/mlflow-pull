@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+import os
+import socket
+import sys
 from pathlib import Path
 
 import pytest
 from mlflow.tracking import MlflowClient
 
-from mlflow_pull import PARENT_RUN_TAG, download_experiment, download_run_tree, main
+from mlflow_pull import (
+    PARENT_RUN_TAG,
+    download_experiment,
+    download_run_tree,
+    main,
+    ssh_command,
+    ssh_tunnel,
+)
 
 
 @pytest.fixture
@@ -77,3 +87,62 @@ def test_out_option_follows_subcommand(
     main(["run", tree["other"], "-o", str(out)])
 
     assert sorted(f.rsplit("/", 1)[1] for f in _files(out)) == ["o.txt"]
+
+
+# Stand-in for ssh: listens on the -L local port until terminated.
+_FAKE_SSH_LISTEN = """
+import socket, sys
+port = sys.argv[sys.argv.index("-L") + 1].split(":")[1]  # bind:port:host:hostport
+srv = socket.create_server(("127.0.0.1", int(port)))
+while True:
+    srv.accept()[0].close()
+"""
+_FAKE_SSH_FAIL = """
+import sys
+sys.stderr.write("Permission denied (publickey).\\n")
+sys.exit(255)
+"""
+
+
+@pytest.fixture
+def fake_ssh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Install a fake ``ssh`` with the given Python body first on PATH."""
+
+    def install(body: str) -> None:
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        script = bin_dir / "ssh"
+        script.write_text(f"#!{sys.executable}\n{body}")
+        script.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    return install
+
+
+def test_ssh_command_forwards_local_port() -> None:
+    cmd = ssh_command("test.invalid", "localhost:5000", 5055)
+
+    assert cmd[0] == "ssh" and cmd[-1] == "test.invalid"
+    assert cmd[cmd.index("-L") + 1] == "127.0.0.1:5055:localhost:5000"
+    assert "ExitOnForwardFailure=yes" in cmd and "BatchMode=yes" in cmd
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="fake ssh is a shebang script")
+def test_tunnel_opens_and_closes(fake_ssh) -> None:
+    fake_ssh(_FAKE_SSH_LISTEN)
+
+    with ssh_tunnel("test.invalid") as uri:
+        host, port = uri.removeprefix("http://").split(":")
+        socket.create_connection((host, int(port)), 1).close()
+
+    with pytest.raises(OSError):
+        socket.create_connection((host, int(port)), 1)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="fake ssh is a shebang script")
+def test_tunnel_reports_ssh_failure(fake_ssh) -> None:
+    fake_ssh(_FAKE_SSH_FAIL)
+
+    with pytest.raises(SystemExit, match="Permission denied"):
+        with ssh_tunnel("test.invalid"):
+            pass

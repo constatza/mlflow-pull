@@ -44,6 +44,17 @@ $env:MLFLOW_TRACKING_URI = "http://localhost:5000"   # current session
 setx MLFLOW_TRACKING_URI "http://localhost:5000"     # persistent, applies to new shells
 ```
 
+### Server behind SSH
+
+If the server listens only on a remote machine, `--ssh HOST` opens an SSH tunnel for the duration of the download and points MLflow at it. `MLFLOW_TRACKING_URI` is not needed then.
+
+```sh
+mlpull --ssh myhost run <run_id>
+export MLPULL_SSH=myhost        # or set it once; PowerShell: setx MLPULL_SSH myhost
+```
+
+The system `ssh` client is used, so `~/.ssh/config` (aliases, `User`, `Port`, `IdentityFile`, `ProxyJump`), ssh-agent and `known_hosts` apply as for `ssh myhost`. It runs non-interactively (`BatchMode`): key authentication must work without a prompt, through ssh-agent or an unencrypted key. The server is assumed at `localhost:5000` as seen from HOST; change it with `--remote HOST:PORT` or `MLPULL_REMOTE`.
+
 ## Use
 
 ```sh
