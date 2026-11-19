@@ -49,8 +49,9 @@ setx MLFLOW_TRACKING_URI "http://localhost:5000"     # persistent, applies to ne
 If the server listens only on a remote machine, `--ssh HOST` opens an SSH tunnel for the duration of the download and points MLflow at it. `MLFLOW_TRACKING_URI` is not needed then.
 
 ```sh
-mlpull --ssh myhost run <run_id>
-export MLPULL_SSH=myhost        # or set it once; PowerShell: setx MLPULL_SSH myhost
+mlpull run --ssh myhost <run_id>
+mlpull run --ssh myhost -z <run_id>   # -z: compress data in transit (ssh -C), like rsync -z
+export MLPULL_SSH=myhost              # or set it once; PowerShell: setx MLPULL_SSH myhost
 ```
 
 The system `ssh` client is used, so `~/.ssh/config` (aliases, `User`, `Port`, `IdentityFile`, `ProxyJump`), ssh-agent and `known_hosts` apply as for `ssh myhost`. It runs non-interactively (`BatchMode`): key authentication must work without a prompt, through ssh-agent or an unencrypted key. The server is assumed at `localhost:5000` as seen from HOST; change it with `--remote HOST:PORT` or `MLPULL_REMOTE`.
@@ -58,11 +59,39 @@ The system `ssh` client is used, so `~/.ssh/config` (aliases, `User`, `Port`, `I
 ## Use
 
 ```sh
-mlpull run <run_id> [-o DIR]               # a run and all its nested runs
-mlpull experiment <name-or-id> [-o DIR]    # every run of an experiment, nested runs included
+mlpull run <run_id>... [options]            # runs and all their nested runs
+mlpull experiment <experiment>... [options] # runs of experiments (names, ids or * globs)
+mlpull run --help                           # every option
 ```
 
-`-o` / `--out` defaults to `./mlflow-downloads`.
+Options go after the command. `-o` / `--out` sets the destination (env `MLPULL_OUT`, default `./mlflow-downloads`); `-j N` downloads N run trees in parallel (default 4).
+
+### Run status
+
+Only `FINISHED` runs are downloaded, so a run that is still going or that crashed never lands as a partial export. A run named on the command line with another status stops the command before anything is written; nested and experiment runs with another status are skipped with a note.
+
+| flag | also downloads |
+|---|---|
+| `-u`, `--unfinished` | `RUNNING`, `SCHEDULED` |
+| `-f`, `--failed` | `FAILED`, `KILLED` |
+| `-a`, `--all` | every status |
+
+### Selecting runs of an experiment
+
+`experiment` takes selection options; all given options must match (AND):
+
+| option | selects runs |
+|---|---|
+| `--since WHEN`, `--until WHEN` | started at/after, or before, WHEN: ISO date or datetime (local time if no zone), or `30m`, `6h`, `2d`, `1w` ago |
+| `--tag KEY=VALUE` | with this tag value; repeatable (`--tag mlflow.user=alice`) |
+| `--param KEY=VALUE` | with this parameter value; repeatable |
+| `--filter EXPR` | matching a raw [MLflow filter](https://mlflow.org/docs/latest/search-runs.html), e.g. `"metrics.loss < 0.1"` |
+
+Without selection options every top-level run is downloaded. With them, every matching run at any depth is downloaded with its nested runs (a match inside another match's subtree is not downloaded twice), directly under `<experiment name>/`.
+
+```sh
+mlpull experiment --ssh myhost --tag phase=report --since 2d 'my-project/study-*'
+```
 
 Child runs are placed inside their parent's directory, so the output mirrors the run tree:
 
