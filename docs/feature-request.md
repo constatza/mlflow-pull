@@ -1,68 +1,42 @@
 # mlpull feature requests
 
-Status: proposed, not implemented. Each item is generic MLflow client behaviour; none names a project, cluster or run layout.
+Status: proposed, not implemented, except where an item says otherwise. Each item is generic MLflow client behaviour; none names a project, cluster or run layout.
 
 ## Today
 
-`mlpull run <ids>` and `mlpull experiment <names|ids|globs>` download artifacts of FINISHED runs, mirroring the nested-run tree (`__init__.py:94-120`). Selection on `experiment`: `--since`, `--until`, `--tag K=V`, `--param K=V`, `--filter`. `--ssh HOST` opens a `-L` tunnel for the duration of the command (`:216-263`).
+`mlpull run <ids>` and `mlpull experiment <names|ids|globs>` download artifacts of FINISHED runs, mirroring the nested-run tree (`tree.py` builds the tree; `plan.py` decides the files and `execute.py` downloads them). `--path`, `--max-size`, `--dry-run` and `--what` make downloads selective, and a per-run manifest makes a repeated pull fetch only what is missing. Selection on `experiment`: `--since`, `--until`, `--tag K=V`, `--param K=V`, `--filter`, `--key`. `mlpull runs` summarises metrics, params and tags of runs of any status as json, jsonl, a Markdown table or text. `run` and `experiment` take `--format jsonl` for one record per run, and the exit codes tell a refusal (1), a usage error (2) and an empty selection (3) apart; see the README. `--ssh HOST` opens a `-L` tunnel for the duration of the command (`tunnel.py`). `cli.py` wires these together.
 
-Gaps seen when the tool is used by people and scripts that read finished or running experiments:
+Gap seen when the tool is used by scripts: `run` takes ids only; `experiment` can select by tag.
 
-- It never reads metrics, params or tags.
-- It writes no JSON and has no list or dry-run mode.
-- `experiment` with no selection pulls every artifact of every run, including model weights, and has no size guard.
-- A re-run downloads everything again.
-- `run` takes ids only; `experiment` can select by tag.
-- The default remote is `localhost:5000`.
+## Deferred
 
-## 1. `mlpull summary` and `mlpull runs`
+- `mlpull compare <run A> <run B>`: a caller can derive it from `mlpull runs --json`, so a separate command adds no capability yet.
+- `~/.config/mlpull/config.toml` with named servers: reading it needs `tomllib`, which is in the standard library only from Python 3.11, and the environment variables `MLPULL_SSH`, `MLPULL_REMOTE` and `MLPULL_OUT` already cover the common case.
 
-Read-only, one MLflow API round trip per run, nothing downloaded.
+## 1. Tunnel hardening
 
-```
-mlpull summary --key <tag value> [--tag-name run_key] --metric 'val/*' --metric 'train/loss/*' --json
-mlpull runs --experiment <name|glob> --tag K=V --since 2d --format md-table --columns name,status,val/loss:min,val/loss:last
-```
+Done: `ssh_command` passes `-o ControlMaster=no -o ControlPath=none`, so an existing ControlPersist master cannot adopt the forward. `--remote` accepts `host:port` and `MLPULL_REMOTE` provides a default, for tracking servers that listen on a port other than 5000.
 
-- Per run: id, name, status, start and end, params, selected tags, and for each metric glob the minimum, the last value, the step of the minimum and the number of points. Optional downsampled history (`--history N`).
-- Formats: `--json`, JSON lines, a Markdown table (`--format md-table --columns ...`), plain text.
-- Metrics, params and tags are safe to read for RUNNING runs, so the FINISHED gate applies to artifacts only.
-- `--key K` is sugar for a tag filter (default tag name is configurable) and is accepted by `run` as well as `experiment`.
-- Why it matters: callers currently write the same `MlflowClient.search_runs` plus `get_metric_history` snippet over and over to get a minimum and a last value.
+Deferred: `ServerAliveInterval` and `ServerAliveCountMax`. They detect a dead peer, not a dead parent, so they do not stop an orphaned `ssh -N` after `mlpull` is killed with SIGKILL. Another mechanism would be needed, and it is not worth the complexity yet.
 
-Tests: a local MLflow store fixture with nested runs, a RUNNING run, and a metric with several steps; assert the min, last and argmin step.
+Not planned: a `ui` subcommand. Opening a server UI in a browser is generic transport and belongs to a managed forward (`rr fwd <name> --open`, see the rr request). mlpull stays MLflow-specific.
 
-## 2. Selective, cheaper downloads
+## 2. Client and server version matrix
 
-- `--what metrics,params,tags,artifacts` (default `artifacts`, unchanged).
-- `--path GLOB` (repeatable, `!GLOB` excludes): `--path 'config/**' --path 'plots/*.png' --path '!model/**'`.
-- `--max-size 1G`: refuse before downloading, as `rr get` does; measured from artifact listings.
-- `--dry-run` and `mlpull ls`: list what would be fetched with sizes.
-- A per-run manifest (`.mlpull.json`: run id, status at pull time, files, sizes) so a finished run already pulled is skipped and a run that was RUNNING is refreshed.
+The client floor is `mlflow-skinny>=3.7`, the first release in which `MlflowClient` hands its own tracking URI to the artifact repository. Older clients resolve `mlflow-artifacts:` stores against the global URI and would ignore the SSH tunnel, so the floor is set by that behaviour and not by what the sqlite-backed suite tolerates (it passes back to 2.10 with `sqlalchemy<2.1` and `setuptools<81`). The existing tests use a sqlite-backed local store, which bypasses `HttpStore`, run-search paging and artifact proxying, so they cannot show that the client works against a real server. Add one slow test (or a documented manual check) that starts a real `mlflow server --app-name basic-auth` and runs the read paths against it.
 
-Tests: path glob include and exclude; size refusal writes nothing; second run is a no-op; a run that finished since the last pull is re-pulled.
+## 3. TODO: authentication without a password in the environment
 
-## 3. `mlpull compare` and structured output
+Not needed today: the servers used with mlpull have no passwords, so nothing is passed. If one is added, `mlpull` should not make users export `MLFLOW_TRACKING_PASSWORD` (it is visible to every child process and to anyone who can read `/proc/<pid>/environ` as that user, and `setx` stores it in the Windows registry in plaintext). Options, in order of preference:
 
-- `mlpull compare <run A> <run B> [--json]`: params that differ and a side-by-side metric table (min, last).
-- JSON-lines output for every command (`{run_id, name, status, dir, files, bytes}`) and distinct exit codes: refused (status gate), usage error, nothing matched.
-- Optional `~/.config/mlpull/config.toml` with named servers (`ssh`, `remote`, `out`), so `--ssh` and the environment variables are not needed for the common case.
-
-## 4. Tunnel hardening (small, non-breaking)
-
-- `ssh_command` (`__init__.py:216`) adds `-o ControlMaster=no -o ControlPath=none`, so an existing ControlPersist master cannot adopt the forward (test at `tests/test_download.py:290`).
-- Default `--remote` accepts `host:port` and an environment default (`MLPULL_REMOTE`); document that a tracking server may listen on a port other than 5000.
-- Add `ServerAliveInterval=15 -o ServerAliveCountMax=3` so an orphaned child ends by itself if the parent is killed with SIGKILL.
-- Do not add a `ui` subcommand. Opening a server UI in a browser is generic transport and belongs to a managed forward (`rr fwd <name> --open`, see the rr request). mlpull stays MLflow-specific.
-
-## 5. Client and server version matrix
-
-The dependency is `mlflow-skinny>=2.10` while servers run 3.x. Add one slow test (or a documented manual check) that runs the read paths against a 3.x server, and raise the floor if 2.10 no longer works.
+- Rely on the SSH tunnel as the only authentication. The tunnel already requires an SSH key, and with the server bound to `127.0.0.1` no one else can reach it, so basic auth adds little. This is the simplest fix and needs no code.
+- If the server keeps basic auth, use a token (`MLFLOW_TRACKING_TOKEN`) instead of a user password, so that it can be revoked and scoped, and read it from a `0600` file or the system keyring at start. The read belongs in `cli.py` only; the pure modules never see it.
+- Do not add a `--password` option: command-line arguments show up in `ps` and in shell history.
 
 ## Breaking changes
 
-None. All additions are new options or commands; defaults of `run` and `experiment` stay.
+Exit code 3 for "nothing matched" replaced exit 0 when `run`, `experiment` or `runs` found no run, and an `experiment` or `runs` glob that matches no experiment now exits 3 instead of 1. All other additions are new options or commands; defaults of `run` and `experiment` stay.
 
 ## Suggested order
 
-1, then 2, then 4 (a few lines), then 3.
+Floor and compatibility (item 2) first. Tunnel hardening (item 1) and authentication (item 3) are independent of the rest.
