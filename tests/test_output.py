@@ -393,6 +393,46 @@ def test_a_listing_the_server_rejects_is_one_line_with_a_hint_and_writes_nothing
     assert not out.exists()
 
 
+def test_another_rejected_parameter_gets_no_hint(
+    store: Store, serve_listing: Callable[..., None], cli: Cli, tmp_path: Path, assert_fails_cleanly
+) -> None:
+    def refused(path: RelPath | None) -> list[ListedEntry]:
+        raise MlflowException("run_id is not a valid id", error_code=INVALID_PARAMETER_VALUE)
+
+    serve_listing(refused)
+
+    line = assert_fails_cleanly(cli("run", store.child, "-o", str(_out(tmp_path))), ExitCode.REFUSED)
+
+    assert line == "run_id is not a valid id"
+
+
+def test_a_multi_line_failure_is_one_line_with_the_breaks_marked(
+    store: Store, serve_listing: Callable[..., None], cli: Cli, tmp_path: Path, assert_fails_cleanly
+) -> None:
+    def failing(path: RelPath | None) -> list[ListedEntry]:
+        raise MlflowException(f"download failed\r\nclient said:\n  {HOSTILE}\n")
+
+    serve_listing(failing)
+
+    line = assert_fails_cleanly(cli("run", store.child, "-o", str(_out(tmp_path))), ExitCode.REFUSED)
+
+    assert line.startswith("download failed | client said: | ") and "\\x0a" not in line and "\\x0d" not in line
+    _assert_escaped(line)
+
+
+def test_a_broken_botocore_does_not_replace_an_exit_with_a_traceback(
+    store: Store, cli: Cli, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken() -> tuple[type[Exception], ...]:
+        raise RuntimeError("botocore is broken")
+
+    monkeypatch.setattr("mlflow_pull.cli._artifact_store_errors", broken)
+
+    result = cli("experiment", "broken")  # holds only a FAILED run: skipped, so nothing matched
+
+    assert result.exit_code == ExitCode.NOTHING_MATCHED, repr(result.exception)
+
+
 def test_other_server_failures_get_no_hint(
     store: Store, serve_listing: Callable[..., None], cli: Cli, tmp_path: Path, assert_fails_cleanly
 ) -> None:

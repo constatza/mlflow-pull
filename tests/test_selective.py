@@ -1425,6 +1425,37 @@ def test_the_fold_setting_reaches_the_plan_of_a_pull(store: Store, tmp_path: Pat
         plan_pull(gateway, resolution, PullOptions(fold_names=True))
 
 
+def _two_cases(path: RelPath | None) -> list[ArtifactEntry]:
+    return [ArtifactFile(RelPath("Model.pkl"), KnownSize(1)), ArtifactFile(RelPath("model.pkl"), KnownSize(1))]
+
+
+@pytest.mark.parametrize("volume_folds", [True, False])
+def test_the_output_directory_decides_whether_names_differing_in_case_clash(
+    store: Store, serve_listing: Callable[..., None], cli: Cli, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    volume_folds: bool,
+) -> None:
+    probed: list[tuple[Path, bool, bool]] = []
+
+    def probe(directory: Path, default: bool, may_write: bool) -> bool:
+        probed.append((directory, default, may_write))
+        return volume_folds
+
+    monkeypatch.setattr("mlflow_pull.cli.case_folds_in", probe)
+    serve_listing(_two_cases)
+    out = tmp_path / "out"
+
+    dry = cli("run", store.child, "--dry-run", "-o", str(out))
+    real = cli("run", store.child, "-o", str(out))
+
+    assert dry.exit_code == (1 if volume_folds else 0), dry.output
+    assert [(directory, default, may_write) for directory, default, may_write in probed] == [
+        (out.resolve(), paths.FOLD_NAMES, False),  # the dry run writes nothing, probe included
+        (out.resolve(), paths.FOLD_NAMES, True),
+    ]
+    if volume_folds:  # refused while planning: the listed names are not real files, so only this case can be asserted
+        assert real.exit_code == 1 and "--path '!model.pkl'" in real.output and not out.exists()
+
+
 # --- names this platform cannot hold are reported, not fatal -------------------------------------------------
 
 
@@ -1545,6 +1576,7 @@ def test_a_failure_before_any_file_landed_writes_no_manifest(store: Store, tmp_p
 # --- an interrupt stops every worker after the file it is fetching --------------------------------------------
 
 INTERRUPT_TIMEOUT_S = 30  # a hung test fails after this instead of hanging the suite
+INTERRUPT_POLL_S = 0.05  # how often the interrupter checks that the call it waits for is still running
 
 
 class InFlightGateway(CountingGateway):
@@ -1601,15 +1633,20 @@ def _two_finished_runs(store: Store) -> tuple[str, str]:
 def test_an_interrupt_lets_each_worker_finish_its_file_and_keeps_what_landed(
     store: Store, tmp_path: Path, stop_requested: threading.Event
 ) -> None:
+    if signal.getsignal(signal.SIGINT) is not signal.default_int_handler:  # ignored (nohup, a CI job) or replaced
+        pytest.skip("SIGINT does not raise KeyboardInterrupt here")
     out = tmp_path / "out"
     runs = _two_finished_runs(store)
     gateway = InFlightGateway(store.client, workers=2, stop_requested=stop_requested)
     plan = plan_pull(gateway, resolve_runs(gateway, list(runs), out, FINISHED), PullOptions())
     main = threading.get_ident()
+    call_returned = threading.Event()  # stops the interrupter when the call ends some other way: no stray SIGINT later
 
     def interrupt_when_both_workers_are_downloading() -> None:
-        if gateway.all_in_flight.wait(INTERRUPT_TIMEOUT_S):
-            signal.pthread_kill(main, signal.SIGINT)
+        while not call_returned.is_set():
+            if gateway.all_in_flight.wait(INTERRUPT_POLL_S):
+                signal.pthread_kill(main, signal.SIGINT)
+                return
 
     interrupter = threading.Thread(target=interrupt_when_both_workers_are_downloading)
     interrupter.start()
@@ -1617,6 +1654,7 @@ def test_an_interrupt_lets_each_worker_finish_its_file_and_keeps_what_landed(
         with pytest.raises(KeyboardInterrupt):
             execute_plan(gateway, plan, jobs=2)
     finally:
+        call_returned.set()
         interrupter.join()
 
     first_file = sorted(SIZES)[0]
@@ -1638,6 +1676,84 @@ def test_a_failing_run_stops_the_other_workers_after_their_current_file(
         execute_plan(gateway, plan, jobs=2)
 
     assert gateway.downloaded == [sorted(SIZES)[0]]  # the healthy run's file in flight, no more
+
+
+LATE_FAILURE_DEADLINE_S = 10  # a stop that never comes fails the test after this instead of hanging it
+
+
+def test_a_failure_that_comes_second_stops_the_first_and_the_queue_and_is_the_error_raised() -> None:
+    """The failing item is noticed when it fails, not when the items before it have finished."""
+    started: list[str] = []
+
+    def work(item: str, stop: execute.StopSignal) -> str:
+        started.append(item)
+        if item == "failing":
+            raise ConnectionError("the server went away")
+        if item == "queued":
+            return item
+        deadline = time.monotonic() + LATE_FAILURE_DEADLINE_S  # "long": runs until told to stop
+        while not stop.requested:
+            assert time.monotonic() < deadline, "the failure of the second item never stopped the first"
+            time.sleep(0.005)
+        raise execute.PullStopped("stopped by the failure of another item")
+
+    with pytest.raises(ConnectionError, match="went away"):
+        execute._map_in_pool(2, work, ["long", "failing", "queued"])
+
+    assert "queued" not in started
+
+
+# --- one run named twice, or inside another named run ------------------------------------------------------------
+
+
+class MeetingGateway(CountingGateway):
+    """Holds each download of one run until two workers are downloading it at once."""
+
+    def __init__(self, client: MlflowClient, run_id: str) -> None:
+        super().__init__(client)
+        self._run_id = run_id
+        self._meeting = threading.Barrier(2, timeout=INTERRUPT_TIMEOUT_S)
+
+    def download_artifact(self, run_id: str, path: RelPath, dest_dir: Path) -> None:
+        if run_id == self._run_id:
+            self._meeting.wait()
+        super().download_artifact(run_id, path, dest_dir)
+
+
+@pytest.fixture
+def serve(monkeypatch: pytest.MonkeyPatch) -> Callable[[RunGateway], None]:
+    """Make the CLI talk to the given gateway instead of connecting to a server."""
+    return lambda gateway: monkeypatch.setattr(MlflowGateway, "connect", classmethod(lambda cls, uri: gateway))
+
+
+def test_a_child_named_beside_its_parent_is_pulled_into_both_places_by_two_workers_at_once(
+    store: Store, serve: Callable[[RunGateway], None], cli: Cli, tmp_path: Path
+) -> None:
+    out = tmp_path / "out"
+    serve(MeetingGateway(store.client, store.child))
+
+    result = cli("run", store.parent, store.child, "-j", "4", "-o", str(out))
+
+    assert result.exit_code == 0 and result.exception is None, result.output
+    assert "Traceback" not in result.output
+    child = f"child-{store.child[:8]}"
+    assert _tree(out) == (
+        {f"parent-{store.parent[:8]}/{name}" for name in SIZES}
+        | {f"parent-{store.parent[:8]}/{child}/c.txt", f"{child}/c.txt"}
+    )
+
+
+def test_a_run_named_twice_is_pulled_once(
+    store: Store, counting: CountingGateway, serve: Callable[[RunGateway], None], cli: Cli, tmp_path: Path
+) -> None:
+    out = tmp_path / "out"
+    serve(counting)
+
+    result = cli("run", store.child, store.child, "-j", "4", "-o", str(out))
+
+    assert result.exit_code == 0 and result.exception is None, result.output
+    assert counting.downloaded == ["c.txt"]
+    assert _tree(out) == {f"child-{store.child[:8]}/c.txt"}
 
 
 # --- a running run grows between listing and download ----------------------------------------------------------

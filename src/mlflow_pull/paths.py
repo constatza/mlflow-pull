@@ -23,7 +23,7 @@ def names_fold_on(platform: str) -> bool:
     return platform in ("win32", "darwin")
 
 
-FOLD_NAMES = names_fold_on(sys.platform)
+FOLD_NAMES = names_fold_on(sys.platform)  # the guess when the output directory's own file system has not been asked
 
 _UNSAFE_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _WINDOWS_RESERVED = frozenset(

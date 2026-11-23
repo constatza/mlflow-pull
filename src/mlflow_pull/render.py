@@ -175,6 +175,18 @@ def printable(cell: str) -> str:
     return "".join(ch if ch.isprintable() else _escape_char(ch) for ch in cell)
 
 
+LINE_SEPARATOR = " | "
+
+
+def one_line(message: str) -> str:
+    """A server or ssh message as a single escaped line: each break between lines becomes ``LINE_SEPARATOR``.
+
+    A multi-line failure (MLflow reports a failed download that way) would otherwise reach the terminal as
+    one line holding a literal ``\\x0a`` per break, which hides where one part ends and the next begins.
+    """
+    return printable(LINE_SEPARATOR.join(line for line in message.splitlines() if line.strip()))
+
+
 def _escape_char(ch: str) -> str:
     code = ord(ch)
     return f"\\x{code:02x}" if code <= 0xFF else f"\\u{code:04x}" if code <= 0xFFFF else f"\\U{code:08x}"

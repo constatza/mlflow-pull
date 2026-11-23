@@ -134,10 +134,13 @@ class RunGateway(Protocol):
         """
 
     def artifact_session(self, run_id: str) -> AbstractContextManager[None]:
-        """Scope of one run's downloads: what they share (a store client, a thread pool) is released on exit."""
+        """Scope of one run's downloads on the calling thread: what they share (a store client, a thread pool) is released on exit.
+
+        Another thread may hold a session of the same run at the same time.
+        """
 
     def download_artifact(self, run_id: str, path: RelPath, dest_dir: Path) -> None:
         """The file ``path`` to ``dest_dir / path``; the caller has made every directory between.
 
-        Only inside ``artifact_session(run_id)``.
+        Only inside ``artifact_session(run_id)`` on the same thread.
         """

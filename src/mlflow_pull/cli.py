@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager
+from dataclasses import replace
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -30,10 +31,11 @@ from mlflow.protos.databricks_pb2 import INVALID_PARAMETER_VALUE, ErrorCode
 from mlflow_pull.execute import DEFAULT_JOBS, execute_plan, plan_pull, summarise_runs
 from mlflow_pull.gateway import MlflowGateway
 from mlflow_pull.exitcodes import ExitCode
+from mlflow_pull.localfs import case_folds_in
 from mlflow_pull.pathfilter import PathFilter
 from mlflow_pull.plan import ARTIFACTS_ONLY, Content, PullOptions, PullPlan, SizeLimitError, UnknownSizeError, parse_size
 from mlflow_pull.ports import RunGateway
-from mlflow_pull.render import Format, default_columns, parse_columns, printable, render
+from mlflow_pull.render import Format, default_columns, one_line, parse_columns, render
 from mlflow_pull.report import OutputFormat, Reported, planned, render_jsonl, render_outcomes, render_plan
 from mlflow_pull.resolve import NoMatchError, resolve_experiments, resolve_run_list, resolve_runs
 from mlflow_pull.summary import MIN_HISTORY_POINTS, RunSummary
@@ -43,6 +45,7 @@ from mlflow_pull.tunnel import DEFAULT_REMOTE, RemoteAddr, SshHost, ssh_tunnel
 
 DEFAULT_OUT = Path("mlflow-downloads")
 DEFAULT_KEY_TAG = "run_key"
+LISTING_REFUSED_MARK = "Invalid path"  # what MLflow's own listing says when it refuses a name such as one with '#'
 LISTING_REFUSED_HINT = (
     "the server refused to list a run's artifacts; an artifact name it cannot serve, "
     "such as one containing '#', is the usual cause"
@@ -158,8 +161,8 @@ def _connected(ssh: str | None, remote: str, compress: bool) -> Iterator[MlflowG
 
 
 def _note(text: str) -> None:
-    """One human line on stderr. Names, statuses and messages may come from the server: no raw control characters."""
-    typer.echo(printable(text), err=True)
+    """One human line on stderr. Names, statuses and messages may come from the server: no raw control characters or line breaks."""
+    typer.echo(one_line(text), err=True)
 
 
 def _artifact_store_errors() -> tuple[type[Exception], ...]:
@@ -186,6 +189,10 @@ def _artifact_store_errors() -> tuple[type[Exception], ...]:
     return errors
 
 
+_EXPECTED_FAILURES = (ValueError, OverflowError, OSError, MlflowException)
+_CONTROL_FLOW = (typer.Exit, typer.Abort, typer.BadParameter)  # how the CLI itself ends or refuses: never a failure to report
+
+
 @contextmanager
 def _failing_cleanly() -> Iterator[None]:
     try:
@@ -193,8 +200,14 @@ def _failing_cleanly() -> Iterator[None]:
     except NoMatchError as err:  # a valid selection that picks nothing
         _note(str(err))
         raise typer.Exit(ExitCode.NOTHING_MATCHED) from None
-    except (ValueError, OverflowError, OSError, MlflowException, *_artifact_store_errors()) as err:
-        # bad input, a server time no calendar holds, unwritable path or missing ssh, unknown id
+    except Exception as err:
+        # bad input, a server time no calendar holds, unwritable path or missing ssh, unknown id.
+        # The artifact-store errors are looked up last, and only for an error that is none of the above:
+        # a broken botocore install must not replace an exit or a real failure with its own traceback.
+        if isinstance(err, _CONTROL_FLOW) or not (
+            isinstance(err, _EXPECTED_FAILURES) or isinstance(err, _artifact_store_errors())
+        ):
+            raise
         _note(str(err))
         raise typer.Exit(ExitCode.REFUSED) from None
 
@@ -257,12 +270,18 @@ def _echo_unsupported(plan: PullPlan, out: Path) -> None:
             _note(f"unsupported name skipped: {file.path.under(run.target.dir).relative_to(out)}")
 
 
+def _folding_as_on(out: Path, options: PullOptions, mode: PullMode) -> PullOptions:
+    """``options`` with ``fold_names`` set from the output directory's own file system, the platform's guess if unsure."""
+    folds = case_folds_in(out, options.fold_names, may_write=mode is PullMode.WRITE)
+    return replace(options, fold_names=folds)
+
+
 def _plan(gateway: RunGateway, resolution: Resolution, options: PullOptions, jobs: int) -> PullPlan:
     """``plan_pull``; a server that rejects a listing as an invalid parameter gets a line saying what that usually means."""
     try:
         return plan_pull(gateway, resolution, options, jobs)
     except MlflowException as err:
-        if err.error_code != ErrorCode.Name(INVALID_PARAMETER_VALUE):
+        if err.error_code != ErrorCode.Name(INVALID_PARAMETER_VALUE) or LISTING_REFUSED_MARK not in err.message:
             raise
         _note(f"{err} ({LISTING_REFUSED_HINT})")
         raise typer.Exit(ExitCode.REFUSED) from None
@@ -299,7 +318,7 @@ def _pull(
                 _echo_records(fmt, resolution.skipped)
                 _note("nothing matched: no run to download")
                 raise typer.Exit(ExitCode.NOTHING_MATCHED)
-            plan = _plan(gateway, resolution, options, jobs)
+            plan = _plan(gateway, resolution, _folding_as_on(out, options, mode), jobs)
             _echo_unsupported(plan, out)
             if mode is PullMode.DRY_RUN:
                 _echo_report(fmt, render_plan(plan, out), (*planned(plan), *resolution.skipped))

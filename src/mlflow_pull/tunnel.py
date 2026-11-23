@@ -19,6 +19,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import IO
 
+from mlflow_pull.render import one_line
+
 SIGTERM_EXIT_CODE = 128 + signal.SIGTERM
 TUNNEL_TIMEOUT_S = 15.0
 MAX_ERROR_CHARS = 2000
@@ -92,7 +94,8 @@ def ssh_command(host: SshHost, remote: RemoteAddr, local_port: int, compress: bo
 
 def _failure(host: SshHost, errors: IO[str]) -> SystemExit:
     errors.seek(0)
-    return SystemExit(f"ssh to {host.name} failed: {errors.read().strip()[-MAX_ERROR_CHARS:]}")
+    # ssh relays what the remote end says before authentication, so it is as untrusted as a server name.
+    return SystemExit(f"ssh to {host.name} failed: {one_line(errors.read().strip()[-MAX_ERROR_CHARS:])}")
 
 
 @contextmanager
@@ -146,7 +149,7 @@ def ssh_tunnel(
                 except OSError:
                     if time.monotonic() > deadline:
                         errors.seek(0)
-                        detail = errors.read().strip()[-MAX_ERROR_CHARS:]
+                        detail = one_line(errors.read().strip()[-MAX_ERROR_CHARS:])
                         raise SystemExit(
                             f"ssh tunnel to {host.name} not ready after {timeout:g} s"
                             + (f": {detail}" if detail else "")

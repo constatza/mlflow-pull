@@ -6,7 +6,7 @@ import contextlib
 import json
 import threading
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -75,18 +75,37 @@ class PullStopped(Exception):
 def _map_in_pool[T, R](jobs: int, work: Callable[[T, StopSignal], R], items: Iterable[T]) -> tuple[R, ...]:
     """``work`` for every item on ``jobs`` threads, results in order.
 
-    On a failure or an interrupt (``KeyboardInterrupt``, the ``SystemExit`` of SIGTERM) the stop signal is
-    raised and queued items are dropped, so the process leaves after the item each thread is in,
-    not after the whole queue: a supervisor's SIGKILL would otherwise orphan an open SSH tunnel.
+    The first item to fail raises the stop signal the moment it fails, whatever its place in the order:
+    an item not yet started is then dropped unread, and the others stop between two files. An interrupt
+    (``KeyboardInterrupt``, the ``SystemExit`` of SIGTERM) does the same. The process then leaves after
+    the item each thread is in, not after the whole queue: a supervisor's SIGKILL would otherwise orphan
+    an open SSH tunnel. The error raised is the first real failure in item order, never the
+    ``PullStopped`` of an item that stopped because of it.
     """
     stop = StopSignal()
-    with ThreadPoolExecutor(jobs) as pool:
+
+    def guarded(item: T) -> R:
+        if stop.requested:
+            raise PullStopped("not started: the pull is stopping")
         try:
-            return tuple(pool.map(lambda item: work(item, stop), items))
+            return work(item, stop)
+        except BaseException:
+            stop.request()
+            raise
+
+    with ThreadPoolExecutor(jobs) as pool:
+        futures: list[Future[R]] = []
+        try:  # submitting is inside the try: an interrupt while queueing must still stop the queue
+            futures.extend(pool.submit(guarded, item) for item in items)
+            wait(futures)
         except BaseException:
             stop.request()
             pool.shutdown(wait=True, cancel_futures=True)
             raise
+        failures = [e for future in futures if (e := future.exception()) is not None]
+        if failures:
+            raise next((e for e in failures if not isinstance(e, PullStopped)), failures[0])
+        return tuple(future.result() for future in futures)
 
 
 class ListingLimitError(ValueError):

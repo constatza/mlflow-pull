@@ -29,7 +29,10 @@ Root = tuple[Run, Children, Path]  # a root run, its experiment's run tree, its 
 
 
 def _assemble(out: Path, allowed: frozenset[str], roots: list[Root]) -> Resolution:
-    flattened = [flatten(run, children, parent_dir, allowed) for run, children, parent_dir in roots]
+    # A root named twice is one target: the same run into the same directory would be downloaded twice at once.
+    # The same run in two directories (also inside another named run) is two targets, each with its own directory.
+    distinct = {(run.info.run_id, parent_dir): (run, children, parent_dir) for run, children, parent_dir in roots}
+    flattened = [flatten(run, children, parent_dir, allowed) for run, children, parent_dir in distinct.values()]
     return Resolution(
         root=out,
         trees=tuple(tuple(targets) for targets, _ in flattened),

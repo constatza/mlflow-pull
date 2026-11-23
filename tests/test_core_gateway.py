@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -18,6 +19,7 @@ from mlflow_pull import gateway as gateway_module
 from mlflow_pull.selection import FINISHED
 
 DATABRICKS_ARTIFACT_URI = "dbfs:/databricks/mlflow-tracking/1/abc/artifacts"
+SESSION_TIMEOUT_S = 30  # a worker that never arrives fails the test after this instead of hanging it
 FILES = {"a.txt": "alpha", "sub/b.txt": "beta"}
 
 
@@ -106,10 +108,54 @@ def test_a_download_outside_a_session_is_refused(gateway: MlflowGateway, two_run
         gateway.download_artifact(two_runs[0], RelPath("a.txt"), tmp_path)
 
 
-def test_one_run_cannot_have_two_sessions(gateway: MlflowGateway, two_runs: list[str]) -> None:
+def test_one_worker_cannot_nest_two_sessions_of_a_run(gateway: MlflowGateway, two_runs: list[str]) -> None:
     with gateway.artifact_session(two_runs[0]), pytest.raises(RuntimeError, match="already has an open"):
         with gateway.artifact_session(two_runs[0]):
             pass
+
+
+def test_two_workers_can_hold_sessions_of_the_same_run_at_once(
+    gateway: MlflowGateway, built: Built, two_runs: list[str], tmp_path: Path
+) -> None:
+    run_id = two_runs[0]
+    both_inside = threading.Barrier(2, timeout=SESSION_TIMEOUT_S)
+
+    def worker(destination: Path) -> None:
+        destination.mkdir()
+        with gateway.artifact_session(run_id):
+            both_inside.wait()
+            gateway.download_artifact(run_id, RelPath("a.txt"), destination)
+
+    with ThreadPoolExecutor(2) as pool:
+        for outcome in [pool.submit(worker, tmp_path / name) for name in ("one", "two")]:
+            outcome.result()
+
+    assert len(built.calls) == 2  # each worker built its own repository
+    assert all(_is_released(repository) for repository in built.repositories)
+    assert [(tmp_path / name / "a.txt").read_text() for name in ("one", "two")] == ["alpha", "alpha"]
+
+
+def test_a_session_is_not_open_to_another_thread(gateway: MlflowGateway, two_runs: list[str], tmp_path: Path) -> None:
+    with gateway.artifact_session(two_runs[0]), ThreadPoolExecutor(1) as pool:
+        elsewhere = pool.submit(gateway.download_artifact, two_runs[0], RelPath("a.txt"), tmp_path)
+        with pytest.raises(RuntimeError, match="no open artifact session"):
+            elsewhere.result()
+
+
+def test_a_repository_without_a_thread_pool_is_still_released_and_the_download_succeeds(
+    two_runs: list[str], client: MlflowClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class Plain:  # a plugin repository: no ``thread_pool``
+        def download_artifacts(self, path: str, dst: str) -> None:
+            (Path(dst) / path).write_text("plugin")
+
+    monkeypatch.setattr(gateway_module, "get_artifact_repository", lambda uri, tracking_uri=None: Plain())
+    gateway = MlflowGateway(client)
+
+    with gateway.artifact_session(two_runs[0]):
+        gateway.download_artifact(two_runs[0], RelPath("a.txt"), tmp_path)
+
+    assert (tmp_path / "a.txt").read_text() == "plugin"
 
 
 # --- Databricks profiles ----------------------------------------------------------------------------------

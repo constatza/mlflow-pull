@@ -51,12 +51,18 @@ class SizeMismatchError(ValueError):
     """A downloaded file is not the size the server listed."""
 
 
-def _kind(path: Path) -> int | None:
-    """The ``st_mode`` of ``path`` itself (a symlink is not followed), or ``None`` when nothing is there."""
+def _lstat(path: Path) -> os.stat_result | None:
+    """``lstat`` of ``path`` itself (a symlink is not followed), or ``None`` when nothing is there."""
     try:
-        return os.lstat(path).st_mode
+        return os.lstat(path)
     except FileNotFoundError:
         return None
+
+
+def _kind(path: Path) -> int | None:
+    """The ``st_mode`` of ``path`` itself, or ``None`` when nothing is there."""
+    found = _lstat(path)
+    return None if found is None else found.st_mode
 
 
 def _refuse_symlink(path: Path, mode: int) -> None:
@@ -235,3 +241,64 @@ def write_atomically(path: Path, text: str) -> None:
             os.unlink(name)
         raise
     _sync_directory(path.parent)
+
+
+# --- whether this directory's file system keeps the case of names -----------------------------------------
+
+_CASE_PROBE_NAME = "CaSe-probe"  # mixed case, so the swapped spelling differs from it in every letter
+
+
+def _same_file_in_both_cases(path: Path) -> bool | None:
+    """Whether ``path`` and its spelling with every letter's case swapped are one file; ``None`` when that cannot tell.
+
+    Only ASCII names are tried: ``"ß".swapcase()`` is ``"SS"``, which is a different name, not another case of it.
+    """
+    swapped = path.with_name(path.name.swapcase())
+    if swapped.name == path.name or not path.name.isascii():
+        return None
+    if (found := _lstat(path)) is None:
+        return None
+    other = _lstat(swapped)
+    return other is not None and os.path.samestat(found, other)
+
+
+def _probe_with_a_file(directory: Path) -> bool:
+    # Only a crash between create and unlink leaves this hidden file; no sweep reaches the pull root.
+    probe = directory / temp_name(_CASE_PROBE_NAME)
+    os.close(os.open(probe, _TEMP_FLAGS, _NEW_FILE_MODE))
+    try:
+        return bool(_same_file_in_both_cases(probe))
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(probe)
+
+
+def _first_verdict_among_existing_names(directory: Path) -> bool | None:
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            if (verdict := _same_file_in_both_cases(Path(entry.path))) is not None:
+                return verdict
+    return None
+
+
+def case_folds_in(directory: Path, default: bool, may_write: bool) -> bool:
+    """Whether names that differ only in case are one file in ``directory``, found by asking its file system.
+
+    The platform alone cannot say: a WSL drive, vfat, exFAT, an SMB share or a ``casefold`` directory
+    ignores case on Linux, and a case-sensitive APFS or NTFS directory keeps it on macOS and Windows. With
+    ``may_write`` a probe file with a mixed-case name is made, looked up under the swapped spelling and
+    removed. Without it, or when the file cannot be made, a name already there is looked up the same way.
+    ``directory`` may not exist yet: its nearest existing ancestor is on the file system it will be made on.
+    ``default`` is the answer when nothing can be tried (an empty directory that may not be written, no access).
+    """
+    existing = next((d for d in (directory, *directory.parents) if d.is_dir()), None)
+    if existing is None:
+        return default
+    if may_write:
+        with contextlib.suppress(OSError):
+            return _probe_with_a_file(existing)
+    with contextlib.suppress(OSError):
+        verdict = _first_verdict_among_existing_names(existing)
+        if verdict is not None:
+            return verdict
+    return default

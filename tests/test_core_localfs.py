@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from mlflow_pull import localfs
 from mlflow_pull.localfs import (
     STALE_TEMP_SECONDS,
     is_plain_directory,
@@ -171,3 +172,80 @@ def test_the_root_itself_may_be_a_symlink(tmp_path: Path) -> None:
     (real / "run").mkdir(parents=True)
     (tmp_path / "root").symlink_to(real)
     assert is_plain_directory(tmp_path / "root", tmp_path / "root" / "run")
+
+
+# --- whether the output directory keeps the case of names ---------------------------------------------------
+
+CASE_SENSITIVE_HERE = sys.platform not in ("win32", "darwin")  # the real tmp_path of the other platforms folds
+
+
+@pytest.fixture
+def case_insensitive_volume(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every name is looked up without regard to case, as on vfat, exFAT, SMB or a WSL drive."""
+    real = localfs._lstat
+
+    def lstat(path: Path) -> os.stat_result | None:
+        parent = path.parent
+        if not parent.is_dir():
+            return None
+        for name in os.listdir(parent):
+            if name.casefold() == path.name.casefold():
+                return real(parent / name)
+        return None
+
+    monkeypatch.setattr(localfs, "_lstat", lstat)
+
+
+@pytest.mark.parametrize("default", [True, False])
+def test_a_volume_that_ignores_case_folds_whatever_the_platform_says(
+    tmp_path: Path, case_insensitive_volume: None, default: bool
+) -> None:
+    assert localfs.case_folds_in(tmp_path, default=default, may_write=True) is True
+    assert list(tmp_path.iterdir()) == []  # the probe file is gone
+
+
+def test_without_permission_to_write_an_existing_mixed_case_name_answers(
+    tmp_path: Path, case_insensitive_volume: None
+) -> None:
+    (tmp_path / "Model.pkl").write_text("x")
+
+    assert localfs.case_folds_in(tmp_path, default=False, may_write=False) is True
+    assert [p.name for p in tmp_path.iterdir()] == ["Model.pkl"]
+
+
+@pytest.mark.parametrize("default", [True, False])
+def test_an_empty_directory_that_may_not_be_written_gives_the_default(tmp_path: Path, default: bool) -> None:
+    assert localfs.case_folds_in(tmp_path, default=default, may_write=False) is default
+    assert localfs.case_folds_in(tmp_path / "1", default=default, may_write=False) is default  # not even made yet
+
+
+def test_a_directory_not_made_yet_is_probed_through_its_nearest_existing_ancestor(
+    tmp_path: Path, case_insensitive_volume: None
+) -> None:
+    root = tmp_path / "later" / "out"
+
+    assert localfs.case_folds_in(root, default=False, may_write=True) is True
+    assert list(tmp_path.iterdir()) == []  # nothing left behind, and the root was not created
+
+
+def test_a_failing_probe_write_falls_back_to_the_names_already_there(
+    tmp_path: Path, case_insensitive_volume: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "Model.pkl").write_text("x")
+
+    def refuse(*args: object, **kwargs: object) -> int:
+        raise PermissionError(errno.EACCES, "read-only")
+
+    monkeypatch.setattr(os, "open", refuse)
+
+    assert localfs.case_folds_in(tmp_path, default=False, may_write=True) is True
+
+
+@pytest.mark.skipif(not CASE_SENSITIVE_HERE, reason="needs a case-sensitive tmp_path")
+@pytest.mark.parametrize("may_write", [True, False])
+def test_a_case_sensitive_directory_keeps_case_whatever_the_platform_says(tmp_path: Path, may_write: bool) -> None:
+    (tmp_path / "Model.pkl").write_text("x")
+    (tmp_path / "other").write_text("y")
+    (tmp_path / "OTHER").write_text("z")
+
+    assert localfs.case_folds_in(tmp_path, default=True, may_write=may_write) is False

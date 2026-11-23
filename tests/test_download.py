@@ -311,6 +311,29 @@ def test_tunnel_opens_and_closes(fake_ssh) -> None:
         socket.create_connection((host, int(port)), 1)
 
 
+_FAKE_SSH_HOSTILE_BANNER = """
+import sys, time
+sys.stderr.write("welcome\\x1b[2J\\u202e\\nPermission denied (publickey).\\n")
+sys.stderr.flush()
+if {stall}:
+    time.sleep(60)  # alive, never listening: the tunnel times out
+sys.exit(255)
+"""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="fake ssh is a shebang script")
+@pytest.mark.parametrize("stall", [False, True])
+def test_a_remote_banner_in_a_tunnel_failure_is_escaped_and_on_one_line(fake_ssh, stall: bool) -> None:
+    fake_ssh(_FAKE_SSH_HOSTILE_BANNER.format(stall=stall))
+
+    with pytest.raises(SystemExit) as caught, ssh_tunnel(SshHost("test.invalid"), timeout=2.0):
+        pass
+
+    message = str(caught.value)
+    assert "\x1b" not in message and "\u202e" not in message and "\n" not in message, repr(message)
+    assert "\\x1b[2J" in message and "\\u202e" in message and "welcome" in message and "Permission denied" in message
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="fake ssh is a shebang script")
 def test_tunnel_reports_ssh_failure(fake_ssh) -> None:
     fake_ssh(_FAKE_SSH_FAIL)
@@ -328,7 +351,7 @@ with ssh_tunnel(SshHost("test.invalid"), timeout=10) as uri:
     sys.stdin.read()
 """
 SIGTERM_EXIT_CODE = 128 + signal.SIGTERM
-WAIT_S = 15.0
+WAIT_S = 60.0  # a cold import of mlflow in the holder's subprocess alone can take tens of seconds
 
 
 def _await_ready(holder: subprocess.Popen[str], timeout: float = WAIT_S) -> None:

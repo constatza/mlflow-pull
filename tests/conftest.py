@@ -15,17 +15,14 @@ from mlflow_pull import MlflowGateway, RunGateway, app
 from mlflow_pull.paths import RelPath
 from mlflow_pull.ports import ListedEntry
 
-AMBIENT_MLFLOW_VARIABLES = frozenset({
-    "MLFLOW_EXPERIMENT_ID", "MLFLOW_TRACKING_USERNAME", "MLFLOW_TRACKING_PASSWORD", "MLFLOW_TRACKING_TOKEN",
-    "MLFLOW_TRACKING_URI",
-})
+AMBIENT_PREFIXES = ("MLFLOW_", "MLPULL_", "DATABRICKS_", "AWS_")  # settings and credentials of the tools under test
 
 
 @pytest.fixture(autouse=True)
 def scrubbed_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     """The developer's own settings must not leak into a test; a test that needs one sets it."""
     for name in list(os.environ):
-        if name.startswith("MLPULL_") or name in AMBIENT_MLFLOW_VARIABLES:
+        if name.startswith(AMBIENT_PREFIXES):
             monkeypatch.delenv(name)
 
 

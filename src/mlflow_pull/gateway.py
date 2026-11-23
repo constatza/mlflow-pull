@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -37,7 +39,9 @@ def entry_from_info(info: FileInfo) -> ListedEntry:
 class MlflowGateway:
     def __init__(self, client: MlflowClient) -> None:
         self._client = client
-        self._open: dict[str, ArtifactRepository] = {}  # one per run inside ``artifact_session``, gone after it
+        # One per worker thread and run inside ``artifact_session``, gone after it: a run planned twice
+        # (named twice, or also inside another named run) is downloaded by two workers at once.
+        self._open: dict[tuple[int, str], ArtifactRepository] = {}
 
     @classmethod
     def connect(cls, tracking_uri: str | None) -> MlflowGateway:
@@ -79,7 +83,9 @@ class MlflowGateway:
 
     @contextmanager
     def artifact_session(self, run_id: str) -> Iterator[None]:
-        """Downloads of ``run_id`` inside the block share one artifact repository, closed when it ends.
+        """Downloads of ``run_id`` inside the block, on the thread that opened it, share one artifact repository, closed when it ends.
+
+        Each thread has its own session: one worker per planned run, and a run can be planned twice.
 
         ``MlflowClient.download_artifact`` resolves a ``runs:/`` URI on every call (about 5 requests per
         file over HTTP); a repository costs about 2 (a listing and the transfer). The repository is built
@@ -88,21 +94,24 @@ class MlflowGateway:
         shut down by anything but garbage collection (it has no ``close``), so the pool is shut down here:
         a pull over thousands of runs must not keep a thread and a store client alive per run.
         """
-        if run_id in self._open:
-            raise RuntimeError(f"run {run_id} already has an open artifact session")
+        key = (threading.get_ident(), run_id)
+        if key in self._open:
+            raise RuntimeError(f"run {run_id} already has an open artifact session on this thread")
         artifact_uri = add_databricks_profile_info_to_artifact_uri(
             self._client.get_run(run_id).info.artifact_uri, self._client.tracking_uri
         )
         repository = get_artifact_repository(artifact_uri, tracking_uri=self._client.tracking_uri)
-        self._open[run_id] = repository
+        self._open[key] = repository
         try:
             yield
         finally:
-            del self._open[run_id]
-            repository.thread_pool.shutdown()
+            del self._open[key]
+            # A repository from a plugin may have no thread pool.
+            if isinstance(pool := getattr(repository, "thread_pool", None), ThreadPoolExecutor):
+                pool.shutdown()
 
     def download_artifact(self, run_id: str, path: RelPath, dest_dir: Path) -> None:
         # The repository writes the file at ``dest_dir / path``, which ``prepare_destination`` has made room for.
-        if (repository := self._open.get(run_id)) is None:
-            raise RuntimeError(f"run {run_id} has no open artifact session")
+        if (repository := self._open.get((threading.get_ident(), run_id))) is None:
+            raise RuntimeError(f"run {run_id} has no open artifact session on this thread")
         repository.download_artifacts(path.value, str(dest_dir))
