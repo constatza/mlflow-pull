@@ -1,12 +1,12 @@
 # mlflow-pull
 
-Download MLflow artifacts in bulk: a single run, a run together with all of its nested runs, or every run of an experiment.
+Download MLflow artifacts in bulk: a single run, a run together with all of its nested runs, or every run of an experiment. Pull only the files you need (`--path`, `--max-size`, `--dry-run`), skip what an earlier pull already fetched, read metrics, params and tags without downloading anything (`mlpull runs`), reach a server behind SSH (`--ssh`), and script it with JSON lines output and exit codes.
 
 The MLflow GUI has no bulk download, and `mlflow artifacts download` fetches one run at a time. Nested (child) runs are separate runs in MLflow, so their artifacts are not included when you download the parent. `mlpull` walks the run tree for you and mirrors it on disk.
 
 ## Install
 
-Requires [uv](https://docs.astral.sh/uv/getting-started/installation/).
+Requires [uv](https://docs.astral.sh/uv/getting-started/installation/), which fetches the Python it needs (3.14 or later).
 
 Install once, then use `mlpull` from any directory:
 
@@ -80,7 +80,7 @@ mlpull runs [options]                       # read-only summary of runs: metrics
 mlpull run --help                           # every option
 ```
 
-Options go after the command. `-o` / `--out` sets the destination (env `MLPULL_OUT`, default `./mlflow-downloads`); `-j N` downloads N run trees in parallel (default 4). A run named twice (`run A A`) is downloaded once; a run named beside its parent (`run PARENT CHILD`) lands in both places, the top level and inside the parent, and the two copies are downloaded independently.
+Options go after the command. `-o` / `--out` sets the destination (env `MLPULL_OUT`, default `./mlflow-downloads`); `-j N` / `--jobs N` downloads N run trees in parallel (default 4); `-z` / `--compress` compresses the SSH connection (needs `--ssh`). A run named twice (`run A A`) is downloaded once; a run named beside its parent (`run PARENT CHILD`) lands in both places, the top level and inside the parent, and the two copies are downloaded independently.
 
 ### Run status
 
@@ -259,7 +259,8 @@ One run search returns only the latest value of each metric. Without `--metric` 
 ```sh
 git clone https://github.com/constatza/mlflow-pull
 cd mlflow-pull
-uv run pytest
+uv run pytest              # fast tests
+uv run pytest -m slow      # only the slow tests: they start a real mlflow server with basic auth (about a minute)
 ```
 
 The modules under `src/mlflow_pull/` split into decision and effect code. `selection`, `paths`, `tree` and `resolve` decide which runs to fetch, and `pathfilter` and `plan` decide which files of each run (globs, size limit, manifest diff), as pure functions or by reading through the `RunGateway` port, so they test without a server. `summary`, `render` and `report` compute and format run summaries and pull reports, and `exitcodes` names the process exit codes. `gateway`, `execute`, `localfs` and `tunnel` perform the effects (MLflow calls, guarded file reads and writes, ssh), and `cli` wires them together; see the docstring in `src/mlflow_pull/__init__.py`. A pull is two steps: `plan_pull` lists and diffs without writing, `execute_plan` fetches exactly the planned files.
