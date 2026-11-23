@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sys
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -41,7 +43,7 @@ from mlflow_pull import (
 from mlflow_pull import execute, paths
 from mlflow_pull.execute import MAX_DEPTH, ListingLimitError
 from mlflow_pull.gateway import entry_from_info
-from mlflow_pull.localfs import STALE_TEMP_SECONDS, NotRegularFileError, SizeMismatchError, SymlinkError
+from mlflow_pull.localfs import STALE_TEMP_SECONDS, NotRegularFileError, SizeMismatchError, SymlinkError, temp_name
 from mlflow_pull.paths import UnsafePathError
 from mlflow_pull.plan import (
     MANIFEST_NAME,
@@ -1370,11 +1372,9 @@ def test_a_symlink_for_a_manifest_to_a_huge_file_is_not_read(
 # --- case and normalisation folding only where the file system folds -----------------------------------------
 
 
-def test_fold_names_is_on_exactly_where_file_systems_fold_names() -> None:
-    from mlflow_pull import plan as plan_module
-
-    assert plan_module.FOLD_NAMES == (sys.platform in ("win32", "darwin"))
-    assert PullOptions().fold_names is plan_module.FOLD_NAMES
+@pytest.mark.parametrize(("platform", "folds"), [("win32", True), ("darwin", True), ("linux", False), ("freebsd14", False), ("cygwin", False)])
+def test_only_the_platforms_whose_file_systems_fold_names_fold_them(platform: str, folds: bool) -> None:
+    assert paths.names_fold_on(platform) is folds
 
 
 def test_names_differing_in_case_are_two_files_where_the_file_system_keeps_case(store: Store, tmp_path: Path) -> None:
@@ -1542,6 +1542,104 @@ def test_a_failure_before_any_file_landed_writes_no_manifest(store: Store, tmp_p
     assert not (_parent_dir(out, store) / MANIFEST_NAME).exists()
 
 
+# --- an interrupt stops every worker after the file it is fetching --------------------------------------------
+
+INTERRUPT_TIMEOUT_S = 30  # a hung test fails after this instead of hanging the suite
+
+
+class InFlightGateway(CountingGateway):
+    """Holds the first download of every healthy worker until the pull is told to stop, and says when all are in flight.
+
+    The run ``failing`` (if any) fails its first download as soon as every healthy worker is in flight.
+    """
+
+    def __init__(self, client: MlflowClient, workers: int, stop_requested: threading.Event, failing: str | None = None) -> None:
+        super().__init__(client)
+        self.all_in_flight = threading.Event()
+        self._workers = workers
+        self._stop_requested = stop_requested
+        self._failing = failing
+        self._held: set[str] = set()
+        self._lock = threading.Lock()
+
+    def download_artifact(self, run_id: str, path: RelPath, dest_dir: Path) -> None:
+        if run_id == self._failing:
+            assert self.all_in_flight.wait(INTERRUPT_TIMEOUT_S), "the other workers never started"
+            raise ConnectionError("the server went away")
+        with self._lock:
+            first = run_id not in self._held
+            self._held.add(run_id)
+            if len(self._held) == self._workers:
+                self.all_in_flight.set()
+        super().download_artifact(run_id, path, dest_dir)
+        if first:
+            assert self._stop_requested.wait(INTERRUPT_TIMEOUT_S), "the pull was never told to stop"
+
+
+@pytest.fixture
+def stop_requested(monkeypatch: pytest.MonkeyPatch) -> threading.Event:
+    """Set the moment the pull raises its stop signal."""
+    told = threading.Event()
+    real_request = execute.StopSignal.request
+
+    def request_and_tell(signal_: execute.StopSignal) -> None:
+        real_request(signal_)
+        told.set()
+
+    monkeypatch.setattr(execute.StopSignal, "request", request_and_tell)
+    return told
+
+
+def _two_finished_runs(store: Store) -> tuple[str, str]:
+    runs = tuple(_make_run(store.client, store.experiment_id, name, SIZES) for name in ("first", "second"))
+    for run_id in runs:
+        store.client.set_terminated(run_id, "FINISHED")
+    return runs
+
+
+@pytest.mark.skipif(not hasattr(signal, "pthread_kill"), reason="needs a signal aimed at the main thread")
+def test_an_interrupt_lets_each_worker_finish_its_file_and_keeps_what_landed(
+    store: Store, tmp_path: Path, stop_requested: threading.Event
+) -> None:
+    out = tmp_path / "out"
+    runs = _two_finished_runs(store)
+    gateway = InFlightGateway(store.client, workers=2, stop_requested=stop_requested)
+    plan = plan_pull(gateway, resolve_runs(gateway, list(runs), out, FINISHED), PullOptions())
+    main = threading.get_ident()
+
+    def interrupt_when_both_workers_are_downloading() -> None:
+        if gateway.all_in_flight.wait(INTERRUPT_TIMEOUT_S):
+            signal.pthread_kill(main, signal.SIGINT)
+
+    interrupter = threading.Thread(target=interrupt_when_both_workers_are_downloading)
+    interrupter.start()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            execute_plan(gateway, plan, jobs=2)
+    finally:
+        interrupter.join()
+
+    first_file = sorted(SIZES)[0]
+    assert gateway.downloaded == [first_file, first_file]  # one per worker, none after the interrupt
+    for run_id, name in zip(runs, ("first", "second")):
+        manifest = json.loads((out / f"{name}-{run_id[:8]}" / MANIFEST_NAME).read_text())
+        assert manifest["files"].keys() == {first_file}
+
+
+def test_a_failing_run_stops_the_other_workers_after_their_current_file(
+    store: Store, tmp_path: Path, stop_requested: threading.Event
+) -> None:
+    out = tmp_path / "out"
+    failing, healthy = _two_finished_runs(store)
+    gateway = InFlightGateway(store.client, workers=1, stop_requested=stop_requested, failing=failing)
+    plan = plan_pull(gateway, resolve_runs(gateway, [failing, healthy], out, FINISHED), PullOptions())
+
+    with pytest.raises(ConnectionError):
+        execute_plan(gateway, plan, jobs=2)
+
+    assert gateway.downloaded == [sorted(SIZES)[0]]  # the healthy run's file in flight, no more
+
+
 # --- a running run grows between listing and download ----------------------------------------------------------
 
 
@@ -1668,7 +1766,7 @@ def test_a_pull_removes_old_leftovers_of_its_own_atomic_writes(store: Store, gat
     out = tmp_path / "out"
     _pull(gateway, [store.child], out)
     run_dir = out / f"child-{store.child[:8]}"
-    stale = run_dir / f".mlpull-{MANIFEST_NAME}.crashed.tmp"
+    stale = run_dir / temp_name(MANIFEST_NAME)
     stale.write_text("{")
     old = time.time() - 2 * STALE_TEMP_SECONDS
     os.utime(stale, (old, old))

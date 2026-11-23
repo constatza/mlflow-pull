@@ -16,6 +16,7 @@ from mlflow_pull.localfs import (
     STALE_TEMP_SECONDS,
     is_plain_directory,
     remove_stale_temp_files,
+    temp_name,
     write_atomically,
 )
 
@@ -60,7 +61,7 @@ def _fsync_failing_on_directories(code: int):
 
 
 @POSIX_ONLY
-@pytest.mark.parametrize("code", [errno.EINVAL, errno.ENOTSUP, errno.EBADF])
+@pytest.mark.parametrize("code", [errno.EINVAL, errno.ENOTSUP, errno.EBADF, errno.ENOSYS])
 def test_a_directory_that_cannot_be_synced_is_not_an_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int
 ) -> None:
@@ -87,10 +88,10 @@ def _age(path: Path, seconds: float) -> None:
 @POSIX_ONLY
 def test_only_our_old_regular_temporary_files_are_removed(tmp_path: Path) -> None:
     old = STALE_TEMP_SECONDS * 2
-    ours = tmp_path / ".mlpull-.mlpull.json.ab12cd.tmp"
-    fresh = tmp_path / ".mlpull-run.json.ef34.tmp"
-    foreign = tmp_path / ".other-run.json.ab.tmp"
-    wrong_end = tmp_path / ".mlpull-run.json.ab"
+    ours = tmp_path / temp_name(".mlpull.json")
+    fresh = tmp_path / temp_name("run.json")
+    foreign = tmp_path / f".other-{temp_name('run.json')[len('.mlpull-'):]}"
+    wrong_end = tmp_path / temp_name("run.json").removesuffix(".tmp")
     precious = tmp_path / "precious"
     link = tmp_path / ".mlpull-link.tmp"
     directory = tmp_path / ".mlpull-dir.tmp"
@@ -107,6 +108,32 @@ def test_only_our_old_regular_temporary_files_are_removed(tmp_path: Path) -> Non
     for kept in (fresh, foreign, wrong_end, precious, directory):
         assert kept.exists()
     assert link.is_symlink() and precious.read_text() == "x"
+
+
+@POSIX_ONLY
+@pytest.mark.parametrize(
+    "lookalike", [".mlpull-notes.tmp", ".mlpull-x.ab12cd.tmp", ".mlpull-x.0123456789ABCDEF.tmp", ".mlpull-.0123456789abcdef.tmp"]
+)
+def test_a_user_artifact_that_only_looks_like_our_temporary_file_survives(tmp_path: Path, lookalike: str) -> None:
+    artifact = tmp_path / lookalike
+    artifact.write_text("mine")
+    _age(artifact, STALE_TEMP_SECONDS * 2)  # copy2 keeps the old mtime of a downloaded file
+
+    remove_stale_temp_files(tmp_path)
+
+    assert artifact.read_text() == "mine"
+
+
+@POSIX_ONLY
+def test_every_name_our_writes_use_is_recognised_as_ours(tmp_path: Path) -> None:
+    leftovers = [tmp_path / temp_name(name) for name in (".mlpull.json", "run.json")]
+    for path in leftovers:
+        path.write_text("{")
+        _age(path, STALE_TEMP_SECONDS * 2)
+
+    remove_stale_temp_files(tmp_path)
+
+    assert not any(path.exists() for path in leftovers)
 
 
 def test_removing_stale_files_from_a_missing_directory_is_nothing(tmp_path: Path) -> None:

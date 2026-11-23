@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import contextlib
 import json
-from collections.abc import Iterator, Sequence
+import threading
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from mlflow.entities import Metric, Run
@@ -51,6 +52,41 @@ from mlflow_pull.tree import Resolution, RunTarget, nested_run_names
 DEFAULT_JOBS = 4
 MAX_DEPTH = 64  # directory levels below the run root; real runs rarely pass a dozen
 MAX_ENTRIES = 200_000  # listed files and directories per run: bounds memory and requests against a hostile server
+
+
+@dataclass(frozen=True, slots=True)
+class StopSignal:
+    """Raised by the thread that waits on the workers, read by every worker between two files."""
+
+    _event: threading.Event = field(default_factory=threading.Event, repr=False)
+
+    def request(self) -> None:
+        self._event.set()
+
+    @property
+    def requested(self) -> bool:
+        return self._event.is_set()
+
+
+class PullStopped(Exception):
+    """A worker stopped before fetching all of a run's files because the pull was interrupted or failed elsewhere."""
+
+
+def _map_in_pool[T, R](jobs: int, work: Callable[[T, StopSignal], R], items: Iterable[T]) -> tuple[R, ...]:
+    """``work`` for every item on ``jobs`` threads, results in order.
+
+    On a failure or an interrupt (``KeyboardInterrupt``, the ``SystemExit`` of SIGTERM) the stop signal is
+    raised and queued items are dropped, so the process leaves after the item each thread is in,
+    not after the whole queue: a supervisor's SIGKILL would otherwise orphan an open SSH tunnel.
+    """
+    stop = StopSignal()
+    with ThreadPoolExecutor(jobs) as pool:
+        try:
+            return tuple(pool.map(lambda item: work(item, stop), items))
+        except BaseException:
+            stop.request()
+            pool.shutdown(wait=True, cancel_futures=True)
+            raise
 
 
 class ListingLimitError(ValueError):
@@ -131,13 +167,11 @@ def plan_pull(
     for target in targets:
         require_within(resolution.root, target.dir)
     nested = nested_run_names(targets)
-    with ThreadPoolExecutor(jobs) as pool:
-        runs = tuple(
-            pool.map(
-                lambda target: _plan_target(gateway, resolution.root, target, nested.get(target.dir, frozenset()), options),
-                targets,
-            )
-        )
+    runs = _map_in_pool(
+        jobs,
+        lambda target, _stop: _plan_target(gateway, resolution.root, target, nested.get(target.dir, frozenset()), options),
+        targets,
+    )
     return PullPlan(options.content, resolution.root, runs)
 
 
@@ -156,14 +190,18 @@ class ChangedDuringPull:
     path: RelPath
 
 
-def _fetch(gateway: RunGateway, root: Path, plan: RunPlan) -> Iterator[Landed | ChangedDuringPull]:
+def _fetch(gateway: RunGateway, root: Path, plan: RunPlan, stop: StopSignal) -> Iterator[Landed | ChangedDuringPull]:
     """Download each planned file into its run directory, yielding each as soon as it is verified.
+
+    The stop signal is read before each file: the one in flight finishes, no further one starts.
 
     A finished run does not change, so a wrong size is an error there; a running run may append
     between the listing and the download, which is not.
     """
     run_id, directory = plan.target.run.info.run_id, plan.target.dir
     for file in plan.files:
+        if stop.requested:
+            raise PullStopped(f"run {run_id}: stopped before {file.path}")
         prepare_destination(root, file.path.under(directory))
         gateway.download_artifact(run_id, file.path, directory)
         try:
@@ -178,7 +216,7 @@ def _save_manifest(plan: RunPlan, landed: dict[RelPath, OnDiskFile]) -> None:
     write_atomically(plan.target.dir / MANIFEST_NAME, plan.record(landed).to_json())
 
 
-def _execute_run(gateway: RunGateway, root: Path, plan: RunPlan, content: Content) -> RunOutcome:
+def _execute_run(gateway: RunGateway, root: Path, plan: RunPlan, content: Content, stop: StopSignal) -> RunOutcome:
     run = plan.target.run
     directory = plan.target.dir
     if plan.files or content.metadata:
@@ -187,12 +225,14 @@ def _execute_run(gateway: RunGateway, root: Path, plan: RunPlan, content: Conten
     landed: dict[RelPath, OnDiskFile] = {}
     changed = 0
     try:
-        for item in _fetch(gateway, root, plan):
-            match item:
-                case Landed(path, found):
-                    landed[path] = found
-                case ChangedDuringPull():
-                    changed += 1
+        # The session is left, and the run's store client released, before the next run of this worker starts.
+        with gateway.artifact_session(run.info.run_id) if plan.files else contextlib.nullcontext():
+            for item in _fetch(gateway, root, plan, stop):
+                match item:
+                    case Landed(path, found):
+                        landed[path] = found
+                    case ChangedDuringPull():
+                        changed += 1
     except BaseException:
         if landed:  # keep the progress: a re-pull then fetches only the rest
             with contextlib.suppress(OSError):  # a failed save must not hide why the download failed
@@ -206,9 +246,12 @@ def _execute_run(gateway: RunGateway, root: Path, plan: RunPlan, content: Conten
 
 
 def execute_plan(gateway: RunGateway, plan: PullPlan, jobs: int = DEFAULT_JOBS) -> tuple[RunOutcome, ...]:
-    """Fetch exactly the planned files, one worker per run."""
-    with ThreadPoolExecutor(jobs) as pool:
-        return tuple(pool.map(lambda run: _execute_run(gateway, plan.root, run, plan.content), plan.runs))
+    """Fetch exactly the planned files, one worker per run.
+
+    An interrupt or a failure stops every worker after the file it is fetching; what they had
+    verified is in their manifests, so the next pull continues from there.
+    """
+    return _map_in_pool(jobs, lambda run, stop: _execute_run(gateway, plan.root, run, plan.content, stop), plan.runs)
 
 
 def pull(
@@ -271,12 +314,7 @@ def summarise_runs(
     Lives here, not in ``summary``, because the history reads are the only effect and share the pool.
     """
     wanted = [(run, key) for run in runs for key in matching_keys(metric_globs, run.data.metrics)]
-    with ThreadPoolExecutor(jobs) as pool:
-        try:
-            fetched = list(pool.map(lambda want: _read_history(gateway, want[0].info.run_id, want[1]), wanted))
-        except BaseException:
-            pool.shutdown(cancel_futures=True)  # do not drain thousands of queued reads after a failure
-            raise
+    fetched = _map_in_pool(jobs, lambda want, _stop: _read_history(gateway, want[0].info.run_id, want[1]), wanted)
     histories: dict[str, dict[str, tuple[Point, ...]]] = {run.info.run_id: {} for run in runs}
     for (run, key), history in zip(wanted, fetched):
         if history:  # a key can lose its points between the search and the read

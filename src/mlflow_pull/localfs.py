@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import os
+import re
 import secrets
 import stat
 import time
@@ -27,11 +28,15 @@ _ENCODING = "utf-8"
 _TEMP_PREFIX = ".mlpull-"
 _TEMP_SUFFIX = ".tmp"
 _TEMP_TOKEN_BYTES = 8
+# Exactly the names ``temp_name`` makes: a user artifact such as ``.mlpull-notes.tmp`` (``copy2`` keeps old mtimes) must survive.
+_TEMP_NAME = re.compile(
+    rf"{re.escape(_TEMP_PREFIX)}.+\.[0-9a-f]{{{2 * _TEMP_TOKEN_BYTES}}}{re.escape(_TEMP_SUFFIX)}", re.DOTALL
+)
 _TEMP_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
 _NEW_FILE_MODE = 0o666  # the umask trims it, as it does for downloaded artifacts
 STALE_TEMP_SECONDS = 3600  # a write takes milliseconds: an hour-old temporary file is from a crash
 # Some NFS, SMB and FUSE mounts cannot fsync a directory; nothing is wrong with the write then.
-_UNSYNCABLE_DIRECTORY = frozenset({errno.EINVAL, errno.ENOTSUP, errno.EBADF})
+_UNSYNCABLE_DIRECTORY = frozenset({errno.EINVAL, errno.ENOTSUP, errno.EBADF, errno.ENOSYS})
 
 
 class SymlinkError(UnsafePathError):
@@ -184,7 +189,7 @@ def _sync_directory(directory: Path) -> None:
 
 def _is_stale_temp_file(entry: os.DirEntry[str], now: float) -> bool:
     """One of our own leftovers: our name pattern, a regular file (not a link), untouched for a long time."""
-    if not (entry.name.startswith(_TEMP_PREFIX) and entry.name.endswith(_TEMP_SUFFIX)):
+    if _TEMP_NAME.fullmatch(entry.name) is None:
         return False
     try:
         found = entry.stat(follow_symlinks=False)
@@ -206,6 +211,10 @@ def remove_stale_temp_files(directory: Path) -> None:
             path.unlink()
 
 
+def temp_name(final_name: str) -> str:
+    return f"{_TEMP_PREFIX}{final_name}.{secrets.token_hex(_TEMP_TOKEN_BYTES)}{_TEMP_SUFFIX}"
+
+
 def write_atomically(path: Path, text: str) -> None:
     """Never leave a half-written file under the final name, and never write through a planted name.
 
@@ -213,7 +222,7 @@ def write_atomically(path: Path, text: str) -> None:
     a guessable name is ignored and two processes writing the same file cannot collide. Its mode
     follows the umask like every downloaded file, so readers of the output directory can read it.
     """
-    name = path.parent / f"{_TEMP_PREFIX}{path.name}.{secrets.token_hex(_TEMP_TOKEN_BYTES)}{_TEMP_SUFFIX}"
+    name = path.parent / temp_name(path.name)
     descriptor = os.open(name, _TEMP_FLAGS, _NEW_FILE_MODE)
     try:
         with os.fdopen(descriptor, "w", encoding=_ENCODING) as handle:

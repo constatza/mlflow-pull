@@ -25,6 +25,7 @@ from typing import Annotated, Optional, TypeVar
 
 import typer
 from mlflow.exceptions import MlflowException
+from mlflow.protos.databricks_pb2 import INVALID_PARAMETER_VALUE, ErrorCode
 
 from mlflow_pull.execute import DEFAULT_JOBS, execute_plan, plan_pull, summarise_runs
 from mlflow_pull.gateway import MlflowGateway
@@ -32,7 +33,7 @@ from mlflow_pull.exitcodes import ExitCode
 from mlflow_pull.pathfilter import PathFilter
 from mlflow_pull.plan import ARTIFACTS_ONLY, Content, PullOptions, PullPlan, SizeLimitError, UnknownSizeError, parse_size
 from mlflow_pull.ports import RunGateway
-from mlflow_pull.render import Format, default_columns, parse_columns, render
+from mlflow_pull.render import Format, default_columns, parse_columns, printable, render
 from mlflow_pull.report import OutputFormat, Reported, planned, render_jsonl, render_outcomes, render_plan
 from mlflow_pull.resolve import NoMatchError, resolve_experiments, resolve_run_list, resolve_runs
 from mlflow_pull.summary import MIN_HISTORY_POINTS, RunSummary
@@ -42,6 +43,10 @@ from mlflow_pull.tunnel import DEFAULT_REMOTE, RemoteAddr, SshHost, ssh_tunnel
 
 DEFAULT_OUT = Path("mlflow-downloads")
 DEFAULT_KEY_TAG = "run_key"
+LISTING_REFUSED_HINT = (
+    "the server refused to list a run's artifacts; an artifact name it cannot serve, "
+    "such as one containing '#', is the usual cause"
+)
 
 T = TypeVar("T")
 R = TypeVar("R")
@@ -152,16 +157,33 @@ def _connected(ssh: str | None, remote: str, compress: bool) -> Iterator[MlflowG
         yield MlflowGateway.connect(uri)
 
 
+def _note(text: str) -> None:
+    """One human line on stderr. Names, statuses and messages may come from the server: no raw control characters."""
+    typer.echo(printable(text), err=True)
+
+
 def _artifact_store_errors() -> tuple[type[Exception], ...]:
     """boto3's errors when it is installed: S3 artifact reads raise them unwrapped, not as MlflowException.
 
-    botocore is not a dependency of this package, so it is looked up only when a failure needs mapping.
+    ``download_file`` raises boto3's own ``Boto3Error`` family (``RetriesExceededError``,
+    ``S3TransferFailedError``) when its retries run out, and botocore's errors before that.
+    Neither library is a dependency of this package, so they are looked up only when a failure
+    needs mapping; each one that is absent contributes nothing.
     """
+    errors: tuple[type[Exception], ...] = ()
     try:
         from botocore.exceptions import BotoCoreError, ClientError
     except ImportError:
-        return ()
-    return (BotoCoreError, ClientError)
+        pass
+    else:
+        errors += (BotoCoreError, ClientError)
+    try:
+        from boto3.exceptions import Boto3Error
+    except ImportError:
+        pass
+    else:
+        errors += (Boto3Error,)
+    return errors
 
 
 @contextmanager
@@ -169,11 +191,11 @@ def _failing_cleanly() -> Iterator[None]:
     try:
         yield
     except NoMatchError as err:  # a valid selection that picks nothing
-        typer.echo(str(err), err=True)
+        _note(str(err))
         raise typer.Exit(ExitCode.NOTHING_MATCHED) from None
     except (ValueError, OverflowError, OSError, MlflowException, *_artifact_store_errors()) as err:
         # bad input, a server time no calendar holds, unwritable path or missing ssh, unknown id
-        typer.echo(str(err), err=True)
+        _note(str(err))
         raise typer.Exit(ExitCode.REFUSED) from None
 
 
@@ -232,7 +254,18 @@ def _echo_unsupported(plan: PullPlan, out: Path) -> None:
     """One stderr line per artifact MLflow cannot download by name: they are skipped, not fatal."""
     for run in plan.runs:
         for file in run.unsupported:
-            typer.echo(f"unsupported name skipped: {file.path.under(run.target.dir).relative_to(out)}", err=True)
+            _note(f"unsupported name skipped: {file.path.under(run.target.dir).relative_to(out)}")
+
+
+def _plan(gateway: RunGateway, resolution: Resolution, options: PullOptions, jobs: int) -> PullPlan:
+    """``plan_pull``; a server that rejects a listing as an invalid parameter gets a line saying what that usually means."""
+    try:
+        return plan_pull(gateway, resolution, options, jobs)
+    except MlflowException as err:
+        if err.error_code != ErrorCode.Name(INVALID_PARAMETER_VALUE):
+            raise
+        _note(f"{err} ({LISTING_REFUSED_HINT})")
+        raise typer.Exit(ExitCode.REFUSED) from None
 
 
 def _pull(
@@ -261,12 +294,12 @@ def _pull(
         try:
             resolution = resolve(gateway, allowed, out)
             for skip in resolution.skipped:
-                typer.echo(f"skipped {skip.label}: {skip.status}", err=True)
+                _note(f"skipped {skip.label}: {skip.status}")
             if resolution.run_count == 0:
                 _echo_records(fmt, resolution.skipped)
-                typer.echo("nothing matched: no run to download", err=True)
+                _note("nothing matched: no run to download")
                 raise typer.Exit(ExitCode.NOTHING_MATCHED)
-            plan = plan_pull(gateway, resolution, options, jobs)
+            plan = _plan(gateway, resolution, options, jobs)
             _echo_unsupported(plan, out)
             if mode is PullMode.DRY_RUN:
                 _echo_report(fmt, render_plan(plan, out), (*planned(plan), *resolution.skipped))
@@ -275,10 +308,10 @@ def _pull(
                 return
             outcomes = execute_plan(gateway, plan, jobs)
         except RunStatusError as err:
-            typer.echo(f"refused (override with -u, -f or -a): {err}", err=True)
+            _note(f"refused (override with -u, -f or -a): {err}")
             raise typer.Exit(ExitCode.REFUSED) from None
         except (SizeLimitError, UnknownSizeError) as err:
-            typer.echo(f"refused (--max-size): {err}", err=True)
+            _note(f"refused (--max-size): {err}")
             raise typer.Exit(ExitCode.REFUSED) from None
     _echo_report(fmt, render_outcomes(outcomes, out), (*outcomes, *resolution.skipped))
 
@@ -392,7 +425,7 @@ def runs(
         try:
             found = resolve_run_list(gateway, experiments or [], filter_string)
         except NoMatchError as err:  # still rendered, so a script reads [] before it sees exit 3
-            typer.echo(str(err), err=True)
+            _note(str(err))
         else:
             rows = summarise_runs(gateway, found, globs, history, jobs)
     text = render(format_, rows, chosen or default_columns(rows, globs))

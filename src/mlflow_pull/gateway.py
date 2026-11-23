@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from mlflow.entities import Experiment, FileInfo, Metric, Run
+from mlflow.exceptions import MlflowException
+from mlflow.protos.databricks_pb2 import ErrorCode
 from mlflow.store.artifact.artifact_repo import ArtifactRepository
 from mlflow.store.artifact.artifact_repository_registry import get_artifact_repository
 from mlflow.tracking import MlflowClient
+from mlflow.utils.uri import add_databricks_profile_info_to_artifact_uri
 
 from mlflow_pull.paths import RelPath, UnsupportedNameError
 from mlflow_pull.ports import ArtifactDir, ArtifactFile, ListedEntry, UnsupportedEntry, size_from_listing
@@ -32,7 +37,7 @@ def entry_from_info(info: FileInfo) -> ListedEntry:
 class MlflowGateway:
     def __init__(self, client: MlflowClient) -> None:
         self._client = client
-        self._repositories: dict[str, ArtifactRepository] = {}  # one per run: see ``_repository``
+        self._open: dict[str, ArtifactRepository] = {}  # one per run inside ``artifact_session``, gone after it
 
     @classmethod
     def connect(cls, tracking_uri: str | None) -> MlflowGateway:
@@ -66,22 +71,38 @@ class MlflowGateway:
         return list(self._client.get_metric_history(run_id, key))
 
     def list_artifacts(self, run_id: str, path: RelPath | None) -> list[ListedEntry]:
-        infos = self._client.list_artifacts(run_id, None if path is None else path.value)
+        try:
+            infos = self._client.list_artifacts(run_id, None if path is None else path.value)
+        except MlflowException as err:  # the server's message names no run
+            raise MlflowException(f"run {run_id}: {err.message}", error_code=ErrorCode.Value(err.error_code)) from err
         return [entry_from_info(info) for info in infos]
 
-    def _repository(self, run_id: str) -> ArtifactRepository:
-        """The run's artifact repository, built once per run from the client's own tracking URI.
+    @contextmanager
+    def artifact_session(self, run_id: str) -> Iterator[None]:
+        """Downloads of ``run_id`` inside the block share one artifact repository, closed when it ends.
 
-        ``MlflowClient.download_artifacts`` resolves a ``runs:/`` URI on every call (about 5 requests per
-        file over HTTP); a repository costs about 2 (a listing and the transfer). The tracking URI
-        comes from the client, never from the environment, so an SSH tunnel's address is honoured.
+        ``MlflowClient.download_artifact`` resolves a ``runs:/`` URI on every call (about 5 requests per
+        file over HTTP); a repository costs about 2 (a listing and the transfer). The repository is built
+        as ``MlflowClient._get_artifact_repo`` builds it, from the client's own tracking URI and never the
+        environment, so an SSH tunnel's address is honoured. MLflow gives it a thread pool that is never
+        shut down by anything but garbage collection (it has no ``close``), so the pool is shut down here:
+        a pull over thousands of runs must not keep a thread and a store client alive per run.
         """
-        if (repository := self._repositories.get(run_id)) is None:
-            artifact_uri = self._client.get_run(run_id).info.artifact_uri
-            repository = get_artifact_repository(artifact_uri, tracking_uri=self._client.tracking_uri)
-            self._repositories[run_id] = repository
-        return repository
+        if run_id in self._open:
+            raise RuntimeError(f"run {run_id} already has an open artifact session")
+        artifact_uri = add_databricks_profile_info_to_artifact_uri(
+            self._client.get_run(run_id).info.artifact_uri, self._client.tracking_uri
+        )
+        repository = get_artifact_repository(artifact_uri, tracking_uri=self._client.tracking_uri)
+        self._open[run_id] = repository
+        try:
+            yield
+        finally:
+            del self._open[run_id]
+            repository.thread_pool.shutdown()
 
     def download_artifact(self, run_id: str, path: RelPath, dest_dir: Path) -> None:
         # The repository writes the file at ``dest_dir / path``, which ``prepare_destination`` has made room for.
-        self._repository(run_id).download_artifacts(path.value, str(dest_dir))
+        if (repository := self._open.get(run_id)) is None:
+            raise RuntimeError(f"run {run_id} has no open artifact session")
+        repository.download_artifacts(path.value, str(dest_dir))

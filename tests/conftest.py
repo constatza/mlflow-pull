@@ -12,6 +12,8 @@ from mlflow.tracking import MlflowClient
 from typer.testing import CliRunner
 
 from mlflow_pull import MlflowGateway, RunGateway, app
+from mlflow_pull.paths import RelPath
+from mlflow_pull.ports import ListedEntry
 
 AMBIENT_MLFLOW_VARIABLES = frozenset({
     "MLFLOW_EXPERIMENT_ID", "MLFLOW_TRACKING_USERNAME", "MLFLOW_TRACKING_PASSWORD", "MLFLOW_TRACKING_TOKEN",
@@ -59,3 +61,28 @@ def assert_fails_cleanly() -> Callable[..., str]:
         return lines[-1]
 
     return check
+
+
+Listing = Callable[[RelPath | None], list[ListedEntry]]
+
+
+class ScriptedListing(MlflowGateway):
+    """A real gateway whose artifact listing is a function: a server holding odd names, or one that fails."""
+
+    def __init__(self, client: MlflowClient, listing: Listing) -> None:
+        super().__init__(client)
+        self._listing = listing
+
+    def list_artifacts(self, run_id: str, path: RelPath | None) -> list[ListedEntry]:
+        return self._listing(path)
+
+
+@pytest.fixture
+def serve_listing(client: MlflowClient, monkeypatch: pytest.MonkeyPatch) -> Callable[[Listing], None]:
+    """Make the CLI talk to ``ScriptedListing(listing)`` instead of connecting to a server."""
+
+    def serve(listing: Listing) -> None:
+        gateway = ScriptedListing(client, listing)
+        monkeypatch.setattr(MlflowGateway, "connect", classmethod(lambda cls, uri: gateway))
+
+    return serve

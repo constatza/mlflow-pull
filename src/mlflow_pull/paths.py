@@ -17,7 +17,13 @@ IS_WINDOWS = os.name == "nt"  # read at call time, so tests can stand in for the
 MAX_COMPONENT_BYTES = 255  # the longest file name ext4, APFS and NTFS (in UTF-16 units) accept
 MAX_PATH_BYTES = 1024  # a whole artifact path; far below PATH_MAX, so a run dir prefix still fits
 
-FOLD_NAMES = sys.platform in ("win32", "darwin")  # file systems that treat names differing in case or Unicode form as one
+
+def names_fold_on(platform: str) -> bool:
+    """Whether the platform's usual file systems (NTFS, APFS) treat names differing in case or Unicode form as one file."""
+    return platform in ("win32", "darwin")
+
+
+FOLD_NAMES = names_fold_on(sys.platform)
 
 _UNSAFE_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _WINDOWS_RESERVED = frozenset(

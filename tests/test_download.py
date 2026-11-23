@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import queue
 import signal
 import socket
 import subprocess
@@ -330,6 +331,45 @@ SIGTERM_EXIT_CODE = 128 + signal.SIGTERM
 WAIT_S = 15.0
 
 
+def _await_ready(holder: subprocess.Popen[str], timeout: float = WAIT_S) -> None:
+    """Fail, with the holder's stderr, unless it prints ``ready`` within ``timeout``.
+
+    ``readline`` has no timeout and would hang the suite if the holder stalled, so it runs on a thread.
+    """
+    first_line: queue.Queue[str] = queue.Queue()
+    threading.Thread(target=lambda: first_line.put(holder.stdout.readline()), daemon=True).start()
+    try:
+        line = first_line.get(timeout=timeout).strip()
+    except queue.Empty:
+        line = f"nothing within {timeout}s"
+    if line != "ready":
+        holder.kill()  # also ends the reader thread: the pipe closes
+        holder.wait()
+        pytest.fail(f"tunnel holder is not ready ({line!r}); stderr: {holder.stderr.read()!r}")
+
+
+def _holder(code: str) -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+
+
+def test_a_holder_that_dies_before_ready_fails_fast_with_its_stderr() -> None:
+    holder = _holder("import sys; sys.exit('no tunnel for you')")
+
+    with pytest.raises(pytest.fail.Exception, match="no tunnel for you"):
+        _await_ready(holder)
+
+
+def test_a_holder_that_never_says_ready_fails_at_the_deadline() -> None:
+    holder = _holder("import time; time.sleep(60)")
+
+    with pytest.raises(pytest.fail.Exception, match="nothing within 0.2s"):
+        _await_ready(holder, timeout=0.2)
+    assert holder.returncode is not None
+
+
 def _alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -345,12 +385,10 @@ def test_sigterm_closes_the_tunnel_instead_of_orphaning_ssh(
     pid_file = tmp_path / "ssh.pid"
     monkeypatch.setenv("FAKE_SSH_PID_FILE", str(pid_file))
     fake_ssh(_FAKE_SSH_RECORD_PID)
-    holder = subprocess.Popen(
-        [sys.executable, "-c", TUNNEL_HOLDER], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
-    )
+    holder = _holder(TUNNEL_HOLDER)
     ssh_pid = None
     try:
-        assert holder.stdout.readline().strip() == "ready"
+        _await_ready(holder)
         ssh_pid = int(pid_file.read_text())
         holder.send_signal(signal.SIGTERM)
 

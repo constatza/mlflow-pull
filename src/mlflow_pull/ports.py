@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -99,8 +100,10 @@ class UnsupportedEntry:
 
 ListedEntry = ArtifactFile | ArtifactDir | UnsupportedEntry
 
-# MLflow downloads through a ``runs:/<id>/<path>`` URI. Downloads of names with ``#`` or ``?`` fail (the
-# URI parser cuts the path there) and ``%41`` looks up ``A`` instead (checked against MLflow 3.17).
+# HTTP-served stores (the ``mlflow-artifacts:`` proxy, ``HttpArtifactRepository``) join the raw artifact
+# path into the endpoint URL, so ``#`` and ``?`` cut it short and ``%41`` is decoded to ``A`` by the server:
+# such a download fetches nothing or another file (checked against MLflow 3.17; over HTTP its own listing
+# already refuses ``#``). Other stores would carry the names, but one rule keeps every store's result the same.
 _UNFETCHABLE = re.compile(r"[#?]|%[0-9A-Fa-f]{2}")
 
 
@@ -130,5 +133,11 @@ class RunGateway(Protocol):
         ``UnsafePathError`` here; a harmless name this machine cannot create is an ``UnsupportedEntry``.
         """
 
+    def artifact_session(self, run_id: str) -> AbstractContextManager[None]:
+        """Scope of one run's downloads: what they share (a store client, a thread pool) is released on exit."""
+
     def download_artifact(self, run_id: str, path: RelPath, dest_dir: Path) -> None:
-        """The file ``path`` to ``dest_dir / path``; the caller has made every directory between."""
+        """The file ``path`` to ``dest_dir / path``; the caller has made every directory between.
+
+        Only inside ``artifact_session(run_id)``.
+        """

@@ -9,15 +9,19 @@ from pathlib import Path
 
 import pytest
 from click.testing import Result
+from mlflow.exceptions import MlflowException
+from mlflow.protos.databricks_pb2 import INVALID_PARAMETER_VALUE
 from mlflow.tracking import MlflowClient
 
-from mlflow_pull import PARENT_RUN_TAG, MlflowGateway
+from mlflow_pull import PARENT_RUN_TAG, ArtifactFile, KnownSize, MlflowGateway, RelPath
 from mlflow_pull.exitcodes import ExitCode
-from mlflow_pull.plan import MANIFEST_NAME
+from mlflow_pull.plan import MANIFEST_NAME, Downloaded, RunTarget
+from mlflow_pull.ports import ListedEntry, UnsupportedEntry
+from mlflow_pull.report import outcome_record, render_outcomes
 
 Cli = Callable[..., Result]
 
-FIELDS = ["run_id", "name", "status", "dir", "outcome", "files", "bytes", "unsupported"]
+FIELDS = ["run_id", "name", "status", "dir", "outcome", "files", "bytes", "unsupported", "changed_during_pull"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,12 +86,12 @@ def test_jsonl_one_record_per_run_with_notes_on_stderr(store: Store, cli: Cli, t
     assert [list(r) for r in records] == [FIELDS] * 3
     assert records == [
         {"run_id": store.parent, "name": "parent", "status": "FINISHED", "dir": parent_dir,
-         "outcome": "downloaded", "files": 1, "bytes": 3, "unsupported": 0},
+         "outcome": "downloaded", "files": 1, "bytes": 3, "unsupported": 0, "changed_during_pull": 0},
         {"run_id": store.child, "name": "child", "status": "FINISHED", "dir": _dir(Path(parent_dir), "child", store.child),
-         "outcome": "downloaded", "files": 1, "bytes": 7, "unsupported": 0},
+         "outcome": "downloaded", "files": 1, "bytes": 7, "unsupported": 0, "changed_during_pull": 0},
         {"run_id": store.failed_child, "name": "bad", "status": "FAILED",
          "dir": _dir(Path(parent_dir), "bad", store.failed_child),
-         "outcome": "skipped_status", "files": 0, "bytes": 0, "unsupported": 0},
+         "outcome": "skipped_status", "files": 0, "bytes": 0, "unsupported": 0, "changed_during_pull": 0},
     ]
     assert f"skipped bad-{store.failed_child[:8]}: FAILED" in result.stderr
     assert "Downloaded 2 run(s), 2 file(s), 10 B" in result.stderr
@@ -283,3 +287,120 @@ def test_search_experiments_follows_page_tokens(store: Store) -> None:
 
     assert sorted(e.name for e in found) == ["Default", "broken", "exp"]
     assert SmallPageClient.pages_served == 3
+
+
+# --- changed_during_pull in the records ----------------------------------------------------------
+
+
+def test_a_record_carries_the_files_that_changed_while_pulling(store: Store, tmp_path: Path) -> None:
+    run = MlflowGateway(store.client).get_run(store.parent)
+    outcome = Downloaded(RunTarget(run, tmp_path), files=3, bytes=9, unsupported=1, changed_during_pull=2)
+
+    record = outcome_record(outcome)
+
+    assert list(record) == FIELDS
+    assert record["changed_during_pull"] == 2
+    assert ", 2 file(s) changed while pulling" in render_outcomes([outcome], tmp_path)
+
+
+# --- server-controlled text never reaches the terminal raw ---------------------------------------------------
+
+CSI = "\x9b"  # a C1 control the terminal reads as an escape sequence introducer
+RLO = "\u202e"  # a bidi override that reverses what follows
+HOSTILE = f"evil{CSI}[2J{RLO}gnp.exe"
+ESCAPED = ("\\x9b", "\\u202e")
+
+
+def _assert_escaped(text: str) -> None:
+    assert CSI not in text and RLO not in text
+    assert all(escape in text for escape in ESCAPED), text
+
+
+@pytest.fixture
+def hostile_run(store: Store) -> str:
+    """A FINISHED run and a FAILED child, both named with a CSI and a bidi override."""
+    exp = store.client.get_experiment_by_name("exp").experiment_id
+    top = _make_run(store.client, exp, HOSTILE, "abc", "FINISHED")
+    _make_run(store.client, exp, HOSTILE, "zz", "FAILED", top)
+    return top
+
+
+def _hostile_listing(path: RelPath | None) -> list[ListedEntry]:
+    return [ArtifactFile(RelPath(f"{HOSTILE}.png"), KnownSize(4)), UnsupportedEntry.named(f"{HOSTILE}-unsupported")]
+
+
+def test_a_pull_escapes_skipped_runs_and_unsupported_names(
+    hostile_run: str, serve_listing: Callable[..., None], cli: Cli, tmp_path: Path
+) -> None:
+    serve_listing(lambda path: [UnsupportedEntry.named(f"{HOSTILE}-unsupported")])
+    result = cli("run", hostile_run, "-o", str(_out(tmp_path)))
+
+    assert result.exit_code == ExitCode.OK, result.stderr
+    _assert_escaped(result.stderr)
+    assert "skipped" in result.stderr and "unsupported name skipped" in result.stderr
+
+
+def test_dry_run_escapes_file_names_and_unsupported_names(
+    hostile_run: str, serve_listing: Callable[..., None], cli: Cli, tmp_path: Path
+) -> None:
+    serve_listing(_hostile_listing)
+    result = cli("run", hostile_run, "--dry-run", "-o", str(_out(tmp_path)))
+
+    assert result.exit_code == ExitCode.OK, result.stderr
+    _assert_escaped(result.stdout)
+    _assert_escaped(result.stderr)
+    assert "unsupported name skipped" in result.stderr
+
+
+def test_dry_run_jsonl_keeps_names_exact_for_machines(
+    hostile_run: str, serve_listing: Callable[..., None], cli: Cli, tmp_path: Path
+) -> None:
+    serve_listing(_hostile_listing)
+    result = cli("run", hostile_run, "--dry-run", "--format", "jsonl", "-o", str(_out(tmp_path)))
+
+    assert [r["name"] for r in _strict_lines(result.stdout)] == [HOSTILE, HOSTILE]
+    _assert_escaped(result.stderr)
+
+
+def test_a_failure_message_from_the_server_is_escaped(
+    store: Store, serve_listing: Callable[..., None], cli: Cli, tmp_path: Path, assert_fails_cleanly
+) -> None:
+    def listing(path: RelPath | None) -> list[ListedEntry]:
+        raise MlflowException(f"server says {HOSTILE}")
+
+    serve_listing(listing)
+    result = cli("run", store.child, "-o", str(_out(tmp_path)))
+
+    _assert_escaped(assert_fails_cleanly(result, ExitCode.REFUSED))
+
+
+# --- a name the server's own listing refuses ----------------------------------------------------------------------
+
+
+def _refused_listing(path: RelPath | None) -> list[ListedEntry]:
+    raise MlflowException("Invalid path", error_code=INVALID_PARAMETER_VALUE)
+
+
+def test_a_listing_the_server_rejects_is_one_line_with_a_hint_and_writes_nothing(
+    store: Store, serve_listing: Callable[..., None], cli: Cli, tmp_path: Path, assert_fails_cleanly
+) -> None:
+    serve_listing(_refused_listing)
+    out = _out(tmp_path)
+
+    line = assert_fails_cleanly(cli("run", store.child, "--format", "jsonl", "-o", str(out)), ExitCode.REFUSED)
+
+    assert "Invalid path" in line and "'#'" in line
+    assert not out.exists()
+
+
+def test_other_server_failures_get_no_hint(
+    store: Store, serve_listing: Callable[..., None], cli: Cli, tmp_path: Path, assert_fails_cleanly
+) -> None:
+    def broken(path: RelPath | None) -> list[ListedEntry]:
+        raise MlflowException("boom")
+
+    serve_listing(broken)
+
+    line = assert_fails_cleanly(cli("run", store.child, "-o", str(_out(tmp_path))), ExitCode.REFUSED)
+
+    assert line == "boom"

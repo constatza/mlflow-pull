@@ -410,10 +410,37 @@ def test_cli_boto_errors_fail_with_one_line_when_botocore_is_installed(
     assert "AccessDenied" in assert_fails_cleanly(cli("runs", "-e", "exp"), 1)
 
 
-def test_cli_boto_errors_are_not_mapped_without_botocore(
+def test_cli_boto3_errors_fail_with_one_line_when_boto3_is_installed(
+    cli: Cli, metric_runs: dict[str, str], monkeypatch: pytest.MonkeyPatch, assert_fails_cleanly
+) -> None:
+    """``download_file`` raises ``RetriesExceededError`` and kin, boto3's own family, when its retries run out."""
+
+    class Boto3Error(Exception):
+        pass
+
+    class RetriesExceededError(Boto3Error):
+        pass
+
+    boto3 = types.ModuleType("boto3")
+    exceptions = types.ModuleType("boto3.exceptions")
+    exceptions.Boto3Error = Boto3Error
+    monkeypatch.setitem(sys.modules, "botocore", None)  # only boto3 is mapped here
+    monkeypatch.setitem(sys.modules, "boto3", boto3)
+    monkeypatch.setitem(sys.modules, "boto3.exceptions", exceptions)
+
+    def exhausted(*_args: object) -> None:
+        raise RetriesExceededError("Max Retries Exceeded")
+
+    monkeypatch.setattr("mlflow_pull.cli.summarise_runs", exhausted)
+
+    assert "Max Retries" in assert_fails_cleanly(cli("runs", "-e", "exp"), 1)
+
+
+def test_cli_boto_errors_are_not_mapped_without_botocore_or_boto3(
     cli: Cli, metric_runs: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setitem(sys.modules, "botocore", None)  # makes the import fail
+    monkeypatch.setitem(sys.modules, "boto3", None)
     monkeypatch.setattr("mlflow_pull.cli.summarise_runs", lambda *_: (_ for _ in ()).throw(KeyError("boom")))
 
     assert isinstance(cli("runs", "-e", "exp").exception, KeyError)  # no blanket except Exception

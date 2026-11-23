@@ -165,8 +165,13 @@ def record(row: RunSummary) -> dict[str, object]:
     }
 
 
-def _printable(cell: str) -> str:
-    """Server-controlled text must not drive the terminal: non-printable characters become escapes."""
+def printable(cell: str) -> str:
+    """Server-controlled text must not drive the terminal: non-printable characters become escapes.
+
+    Control characters of every range (C0, DEL, C1 such as CSI) and format characters (bidi overrides)
+    are not printable, so ``isprintable`` is the whole rule; every human-readable line holding names
+    from a server goes through this one function.
+    """
     return "".join(ch if ch.isprintable() else _escape_char(ch) for ch in cell)
 
 
@@ -189,13 +194,13 @@ def _escape_md(cell: str) -> str:
 
 def _md_table(rows: Sequence[RunSummary], columns: Sequence[Column]) -> str:
     """Header and separator rows always; no runs gives the headers only."""
-    header, *body = _table(rows, columns, lambda cell: _printable(_escape_md(cell)))
+    header, *body = _table(rows, columns, lambda cell: printable(_escape_md(cell)))
     lines = [header, ["---"] * len(columns), *body]
     return "\n".join(f"| {' | '.join(line)} |" for line in lines)
 
 
 def _text(rows: Sequence[RunSummary], columns: Sequence[Column]) -> str:
-    table = _table(rows, columns, _printable)
+    table = _table(rows, columns, printable)
     widths = [max(len(line[i]) for line in table) for i in range(len(columns))]
     return "\n".join(TEXT_GAP.join(cell.ljust(w) for cell, w in zip(line, widths)).rstrip() for line in table)
 

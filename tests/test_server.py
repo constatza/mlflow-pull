@@ -36,6 +36,7 @@ BOGUS_URI = "http://127.0.0.1:1"
 @dataclass(slots=True, frozen=True)
 class Server:
     uri: str
+    artifacts: Path  # where the server keeps artifacts on disk, for tests that plant files no client could log
 
 
 @dataclass(slots=True, frozen=True)
@@ -104,7 +105,7 @@ def server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Server]:
         )
         try:
             _wait_healthy(uri, proc, log)
-            yield Server(uri)
+            yield Server(uri, root / "art")
         finally:
             proc.terminate()
             try:
