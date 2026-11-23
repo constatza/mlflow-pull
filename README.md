@@ -69,7 +69,7 @@ Things to know about the tunnel:
 - It listens on `127.0.0.1` on a random port. Every local user of that machine can connect to that port. On a shared machine, only use `--ssh` with servers that require authentication.
 - The SSH connection protects the path to the SSH host only. The last hop, from the SSH host to the server, is plain HTTP unless `--remote` points at a loopback address on that host.
 - A server that binds `0.0.0.0` on a shared login node sends basic-auth passwords in cleartext over the cluster network. Bind the server to `127.0.0.1` where possible and let `--ssh` reach it there.
-- `--ssh` ignores any existing `ControlMaster` or `ControlPath` setting (it passes `-o ControlMaster=no -o ControlPath=none`). Otherwise an already-running master connection would adopt the forward and keep it open after `mlpull` exits; with these options the forward closes when `mlpull` does. That holds when `mlpull` ends normally, on an error, on Ctrl-C and on SIGTERM (a plain `kill`, exit code 143). SIGKILL (`kill -9`) cannot be caught and leaves `ssh -N` running; find it with `pgrep -af 'ssh -N'` and stop it.
+- `--ssh` ignores any existing `ControlMaster` or `ControlPath` setting (it passes `-o ControlMaster=no -o ControlPath=none`). Otherwise an already-running master connection would adopt the forward and keep it open after `mlpull` exits; with these options the forward closes when `mlpull` does. That holds when `mlpull` ends normally, on an error, on Ctrl-C and on SIGTERM (a plain `kill`, exit code 143). On Ctrl-C, SIGTERM or the first failing run, each running worker stops after the file it is fetching, keeps a manifest of the files it finished, and then the tunnel closes; a large file in flight delays that by its own download time. SIGKILL (`kill -9`) cannot be caught and leaves `ssh -N` running; find it with `pgrep -af 'ssh -N'` and stop it.
 
 ## Use
 
@@ -163,7 +163,7 @@ The tracking server and the artifact store are not trusted, and neither is what 
 
 Every directory and file below the output directory is checked with `lstat` before it is created or written, and a symlink anywhere on the way is an error (exit code 1), so a link planted in an earlier or hostile pull cannot redirect a download. The output directory itself and its parents may be symlinks. A process that can swap a directory for a link between the check and the download is not stopped. The manifest and `run.json` are written through a fresh, exclusively created temporary file that is synced and renamed over the target, so two pulls into one directory do not collide (the last one wins) and a planted `.mlpull.json.tmp` is never followed; they get the permissions the umask gives every downloaded file, so group readers of a shared output directory can read them, and a temporary file left by a crash is removed by the next pull of that run once it is an hour old. A run directory that is a symlink is never read for a manifest (nothing counts as downloaded) and the pull of that run stops with an error. MLflow decides itself whether a listed file is a directory and then downloads it recursively; mlpull cannot stop that and reports it as an error afterwards.
 
-MLflow cannot download an artifact whose name contains `#`, `?` or a percent escape such as `%41`: it builds a `runs:/` URI from the name, and these names fetch nothing or another file. Such artifacts are skipped, counted (`unsupported` in the jsonl record, `N unsupported name(s) skipped` in the summary and dry-run lines), named on stderr, and left out of `--max-size` and the manifest. The rest of the run is downloaded. Names with `;`, a lone `%`, spaces, `+` or non-ASCII letters are fine.
+MLflow's HTTP artifact routes (the `mlflow-artifacts:` proxy and `http(s)` artifact stores) put the artifact name into the request URL unescaped, so they cannot download a name containing `#` or `?` (the URL is cut there) or a percent escape such as `%41` (the server decodes it and sends the file named `A` instead). Such artifacts are skipped, counted (`unsupported` in the jsonl record, `N unsupported name(s) skipped` in the summary and dry-run lines), named on stderr, and left out of `--max-size` and the manifest. The rest of the run is downloaded. The skip applies on every store, so a pull lands the same files whichever way MLflow serves them. One case is not skipped: over HTTP, MLflow's own listing refuses a whole directory that holds a `#` name (`Invalid path`), so the pull fails with exit code 1 before anything is written. mlpull prints that message on one line with a hint that an artifact name the server cannot serve is the usual cause, and the run cannot be pulled over HTTP until that artifact is renamed or removed on the server. Names with `;`, a lone `%`, spaces, `+` or non-ASCII letters are fine.
 
 A run still `RUNNING` (pulled with `-u`) can append to an artifact between the listing and the download. For such a run a file that is not the size listed is not an error: it is counted (`N file(s) changed while pulling` in the final line), left out of the manifest and fetched again by the next pull. For a finished run a size mismatch stays an error.
 
@@ -173,7 +173,7 @@ The final line reads `Downloaded N run(s), M file(s), SIZE to <dir> (K run(s) al
 
 ## Output and exit codes
 
-`run` and `experiment` print for people by default: skipped runs and refusals on stderr, and a last line on stdout. `--format jsonl` is for scripts: stdout carries only JSON lines, one per run, and every human note (skipped runs, refusals, the summary line, and the file listing of `--dry-run`) goes to stderr.
+`run` and `experiment` print for people by default: skipped runs and refusals on stderr, and a last line on stdout. `--format jsonl` is for scripts: stdout carries only JSON lines, one per run, and every human note (skipped runs, refusals, the summary line, and the file listing of `--dry-run`) goes to stderr. In every human line (the notes, the `--dry-run` listing, error messages and the `runs` text and `md-table` formats) a character that could drive the terminal, such as a control character or a bidi override in a run or artifact name, is shown as an escape like `\x9b` or `\u202e`; JSON and jsonl output keep names exactly.
 
 ```sh
 mlpull run <run_id> --format jsonl 2>/dev/null | jq -r 'select(.outcome == "downloaded") | .dir'
@@ -182,7 +182,7 @@ mlpull run <run_id> --format jsonl 2>/dev/null | jq -r 'select(.outcome == "down
 Each line is one strict JSON object (no NaN, UTF-8-safe ASCII, no blank lines):
 
 ```json
-{"run_id": "...", "name": "parent", "status": "FINISHED", "dir": "/abs/out/parent-1a2b3c4d", "outcome": "downloaded", "files": 12, "bytes": 3407, "unsupported": 0}
+{"run_id": "...", "name": "parent", "status": "FINISHED", "dir": "/abs/out/parent-1a2b3c4d", "outcome": "downloaded", "files": 12, "bytes": 3407, "unsupported": 0, "changed_during_pull": 0}
 ```
 
 | `outcome` | meaning | `files`, `bytes` |
@@ -192,7 +192,7 @@ Each line is one strict JSON object (no NaN, UTF-8-safe ASCII, no blank lines):
 | `skipped_status` | the run's status is not allowed (see Run status); its nested runs are left out too | 0, 0 |
 | `would_download` | `--dry-run` only: what a pull would fetch | files and size that would be fetched |
 
-`unsupported` counts the artifacts skipped because MLflow cannot download their names (see Safety of downloads); it is 0 for `skipped_status`. `dir` is absolute: where the run's files are, or would go. The records come in the order the runs were resolved (each run before its nested runs); runs skipped by status come after the others. With `--dry-run`, `--format jsonl` still lists the records and still stops with exit code 1 when `--max-size` would refuse the download.
+`unsupported` counts the artifacts skipped because MLflow cannot download their names (see Safety of downloads); it is 0 for `skipped_status`. `changed_during_pull` counts the files of a still-running run that grew after they were listed (see Safety of downloads; the summary line says `N file(s) changed while pulling` with the same number); it is 0 for every outcome but `downloaded`. `dir` is absolute: where the run's files are, or would go. The records come in the order the runs were resolved (each run before its nested runs); runs skipped by status come after the others. With `--dry-run`, `--format jsonl` still lists the records and still stops with exit code 1 when `--max-size` would refuse the download.
 
 Exit codes:
 
@@ -205,7 +205,7 @@ Exit codes:
 
 A pull or `runs` that finds nothing exits 3, so a script can tell an empty result from a download. A glob is a selection, so a glob that matches no experiment exits 3; a plain name or id that does not exist is a mistake and exits 1. SIGTERM ends the process with 143 (128 + 15) after closing the tunnel.
 
-Every failure above prints one line on stderr and no traceback. The one residual: an artifact store whose client raises its own exception type. boto3 errors (`botocore` `BotoCoreError`, `ClientError`) are mapped to one line when boto3 is installed; any other store library's own error types are not and show a traceback with exit code 1.
+Every failure above prints one line on stderr and no traceback. The one residual: an artifact store whose client raises its own exception type. boto3 errors (`botocore`'s `BotoCoreError` and `ClientError`, and boto3's own `Boto3Error` family such as `RetriesExceededError` and `S3TransferFailedError`) are mapped to one line when the library is installed; any other store library's own error types are not and show a traceback with exit code 1.
 
 ## Reading runs
 
