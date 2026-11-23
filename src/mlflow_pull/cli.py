@@ -35,7 +35,7 @@ from mlflow_pull.ports import RunGateway
 from mlflow_pull.render import Format, default_columns, parse_columns, render
 from mlflow_pull.report import OutputFormat, Reported, planned, render_jsonl, render_outcomes, render_plan
 from mlflow_pull.resolve import NoMatchError, resolve_experiments, resolve_run_list, resolve_runs
-from mlflow_pull.summary import MIN_HISTORY_POINTS
+from mlflow_pull.summary import MIN_HISTORY_POINTS, RunSummary
 from mlflow_pull.selection import RunStatusError, allowed_statuses, build_filter, parse_when
 from mlflow_pull.tree import Resolution
 from mlflow_pull.tunnel import DEFAULT_REMOTE, RemoteAddr, SshHost, ssh_tunnel
@@ -152,6 +152,18 @@ def _connected(ssh: str | None, remote: str, compress: bool) -> Iterator[MlflowG
         yield MlflowGateway.connect(uri)
 
 
+def _artifact_store_errors() -> tuple[type[Exception], ...]:
+    """boto3's errors when it is installed: S3 artifact reads raise them unwrapped, not as MlflowException.
+
+    botocore is not a dependency of this package, so it is looked up only when a failure needs mapping.
+    """
+    try:
+        from botocore.exceptions import BotoCoreError, ClientError
+    except ImportError:
+        return ()
+    return (BotoCoreError, ClientError)
+
+
 @contextmanager
 def _failing_cleanly() -> Iterator[None]:
     try:
@@ -159,7 +171,8 @@ def _failing_cleanly() -> Iterator[None]:
     except NoMatchError as err:  # a valid selection that picks nothing
         typer.echo(str(err), err=True)
         raise typer.Exit(ExitCode.NOTHING_MATCHED) from None
-    except (ValueError, OSError, MlflowException) as err:  # bad input, unwritable path, unknown id
+    except (ValueError, OverflowError, OSError, MlflowException, *_artifact_store_errors()) as err:
+        # bad input, a server time no calendar holds, unwritable path or missing ssh, unknown id
         typer.echo(str(err), err=True)
         raise typer.Exit(ExitCode.REFUSED) from None
 
@@ -240,10 +253,11 @@ def _pull(
 
     With ``jsonl`` stdout carries only the run records; every note goes to stderr.
     """
-    out = out.resolve()  # records and the summary name absolute directories
     allowed = options.content.statuses(unfinished or any_status, failed or any_status)
 
-    with _connected(ssh, remote, compress) as gateway, _failing_cleanly():
+    # The handler is outermost so a failure to open the tunnel is one line, not a traceback.
+    with _failing_cleanly(), _connected(ssh, remote, compress) as gateway:
+        out = out.resolve()  # records and the summary name absolute directories
         try:
             resolution = resolve(gateway, allowed, out)
             for skip in resolution.skipped:
@@ -373,9 +387,14 @@ def runs(
         chosen = None if columns is None else parse_columns(columns, globs)
     except ValueError as err:
         raise typer.BadParameter(str(err), param_hint="--columns") from None
-    with _connected(ssh, remote, compress) as gateway, _failing_cleanly():
-        found = resolve_run_list(gateway, experiments or [], filter_string)
-        rows = summarise_runs(gateway, found, globs, history, jobs)
+    rows: Sequence[RunSummary] = ()
+    with _failing_cleanly(), _connected(ssh, remote, compress) as gateway:
+        try:
+            found = resolve_run_list(gateway, experiments or [], filter_string)
+        except NoMatchError as err:  # still rendered, so a script reads [] before it sees exit 3
+            typer.echo(str(err), err=True)
+        else:
+            rows = summarise_runs(gateway, found, globs, history, jobs)
     text = render(format_, rows, chosen or default_columns(rows, globs))
     if text:  # an empty jsonl result is no output, not a blank line
         typer.echo(text)

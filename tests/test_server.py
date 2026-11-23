@@ -119,8 +119,6 @@ def credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MLFLOW_TRACKING_USERNAME", ADMIN_USER)
     monkeypatch.setenv("MLFLOW_TRACKING_PASSWORD", ADMIN_PASSWORD)
     monkeypatch.setenv("MLFLOW_TRACKING_URI", BOGUS_URI)
-    monkeypatch.delenv("MLPULL_SSH", raising=False)
-    monkeypatch.delenv("MLPULL_OUT", raising=False)
 
 
 @pytest.fixture(scope="module")
@@ -177,6 +175,7 @@ def test_cli_wrong_password_exits_one_with_one_line_and_writes_nothing(
     credentials: None,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    assert_fails_cleanly,
 ) -> None:
     monkeypatch.setenv("MLFLOW_TRACKING_URI", server.uri)
     monkeypatch.setenv("MLFLOW_TRACKING_PASSWORD", "wrong-password")
@@ -184,8 +183,5 @@ def test_cli_wrong_password_exits_one_with_one_line_and_writes_nothing(
 
     result = CliRunner().invoke(app, ["run", seeded.parent, "-o", str(out)])
 
-    assert result.exit_code == 1, repr(result.exception)
-    assert result.exception is None or isinstance(result.exception, SystemExit)
-    assert len(result.output.strip().splitlines()) == 1
-    assert "Traceback" not in result.output
+    assert_fails_cleanly(result, 1)
     assert not out.exists()

@@ -322,18 +322,44 @@ def test_listed_sizes_are_known_unknown_or_rejected() -> None:
 
 
 @POSIX_ONLY
-def test_atomic_write_does_not_follow_a_planted_temp_symlink(tmp_path: Path) -> None:
-    victim = tmp_path / "victim.txt"
-    victim.write_text("precious")
-    (tmp_path / ".mlpull.json.tmp").symlink_to(victim)
-    (tmp_path / "manifest.json.tmp").symlink_to(tmp_path / "nowhere" / "dangling")
+@pytest.mark.parametrize("target_exists", [True, False], ids=["existing-file", "dangling"])
+def test_atomic_write_never_writes_through_a_symlink_planted_at_its_temporary_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target_exists: bool
+) -> None:
+    """Whatever name the implementation picks, an attacker who guesses it first gains nothing.
 
-    write_atomically(tmp_path / ".mlpull.json", "new")
-    write_atomically(tmp_path / "manifest.json", "new")
+    The spy plants a symlink at the first path about to be created in the directory, then lets the
+    real open run; an implementation that follows symlinks would write through it.
+    """
+    victim = tmp_path / "elsewhere" / "victim.txt"
+    victim.parent.mkdir()
+    if target_exists:
+        victim.write_text("precious")
+    directory = tmp_path / "out"
+    directory.mkdir()
+    real_open = os.open
+    planted: list[str] = []
 
-    assert victim.read_text() == "precious"
-    assert (tmp_path / ".mlpull.json").read_text() == "new" and (tmp_path / "manifest.json").read_text() == "new"
-    assert not (tmp_path / "nowhere").exists()
+    def planting_open(path, flags, *args, **kwargs):
+        if not planted and flags & os.O_CREAT and Path(path).parent == directory:
+            os.symlink(victim, path)
+            planted.append(os.fspath(path))
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", planting_open)
+    target = directory / "manifest.json"
+
+    try:
+        write_atomically(target, "new")
+    except OSError:
+        pass  # refusing is as safe as retrying under a fresh name
+
+    assert planted, "the spy never saw a file being created: the test checks nothing"
+    if target_exists:
+        assert victim.read_text() == "precious"
+    else:
+        assert not victim.exists()
+    assert not target.is_symlink()
 
 
 def test_atomic_writes_replace_and_leave_nothing_behind(tmp_path: Path) -> None:

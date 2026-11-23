@@ -7,15 +7,19 @@ ssh would read as an option (``-oProxyCommand=...``) never reaches its argv.
 from __future__ import annotations
 
 import re
+import signal
 import socket
 import subprocess
+import sys
 import tempfile
+import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import IO
 
+SIGTERM_EXIT_CODE = 128 + signal.SIGTERM
 TUNNEL_TIMEOUT_S = 15.0
 MAX_ERROR_CHARS = 2000
 _POLL_S = 0.2
@@ -92,6 +96,28 @@ def _failure(host: SshHost, errors: IO[str]) -> SystemExit:
 
 
 @contextmanager
+def _sigterm_closes_the_tunnel() -> Iterator[None]:
+    """Turn SIGTERM into ``SystemExit`` so the ``finally`` that stops ssh runs.
+
+    Without it a plain ``kill`` ends Python at once and leaves ``ssh -N`` forwarding an
+    unauthenticated loopback port to the server. SIGKILL still cannot be caught.
+    Signal handlers can only be set from the main thread, and Windows has no SIGTERM to catch.
+    """
+    if sys.platform == "win32" or threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def exit_now(_signum: int, _frame: object) -> None:
+        raise SystemExit(SIGTERM_EXIT_CODE)
+
+    previous = signal.signal(signal.SIGTERM, exit_now)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+@contextmanager
 def ssh_tunnel(
     host: SshHost,
     remote: RemoteAddr = DEFAULT_REMOTE,
@@ -102,7 +128,7 @@ def ssh_tunnel(
     port = _free_port()
     # A file, not a pipe: nothing reads ssh's stderr while the tunnel runs, and a full
     # pipe would block ssh mid-download.
-    with tempfile.TemporaryFile("w+", errors="replace") as errors:  # localized ssh messages may not be UTF-8
+    with _sigterm_closes_the_tunnel(), tempfile.TemporaryFile("w+", errors="replace") as errors:  # localized ssh messages may not be UTF-8
         proc = subprocess.Popen(
             ssh_command(host, remote, port, compress),
             stdin=subprocess.DEVNULL,

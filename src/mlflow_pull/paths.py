@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,8 @@ from pathlib import Path
 IS_WINDOWS = os.name == "nt"  # read at call time, so tests can stand in for the other platform
 MAX_COMPONENT_BYTES = 255  # the longest file name ext4, APFS and NTFS (in UTF-16 units) accept
 MAX_PATH_BYTES = 1024  # a whole artifact path; far below PATH_MAX, so a run dir prefix still fits
+
+FOLD_NAMES = sys.platform in ("win32", "darwin")  # file systems that treat names differing in case or Unicode form as one
 
 _UNSAFE_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _WINDOWS_RESERVED = frozenset(
@@ -27,7 +30,11 @@ _DOT_COMPONENTS = frozenset({".", ".."})
 
 
 class UnsafePathError(ValueError):
-    """A destination resolves outside the output directory."""
+    """A name or destination that is hostile or resolves outside the output directory: the pull stops."""
+
+
+class UnsupportedNameError(UnsafePathError):
+    """A harmless name this platform cannot create (too long, or a Windows-only rule): skip it, do not stop."""
 
 
 def safe_component(name: str) -> str:
@@ -41,39 +48,24 @@ def safe_component(name: str) -> str:
 
 
 def fold(text: str) -> str:
-    """The key under which two names are the same file on a case-insensitive or normalising file system."""
-    return unicodedata.normalize("NFC", text).casefold()
+    """The key under which two names are the same file on a case-insensitive or normalising file system.
+
+    Canonical decomposition both before and after case folding is the standard recipe for caseless
+    matching: folding can produce characters that only decompose afterwards.
+    """
+    return unicodedata.normalize("NFD", unicodedata.normalize("NFD", text).casefold())
 
 
-def _size_violation(text: str) -> str | None:
+def _hard_violation(text: str) -> str | None:
+    """Why ``text`` is hostile on every platform: an error, never a name to skip."""
     try:
-        encoded = text.encode("utf-8")
+        text.encode("utf-8")
     except UnicodeEncodeError:  # a lone surrogate: no file system stores it
         return "not valid UTF-8"
-    if len(encoded) > MAX_PATH_BYTES:
-        return f"longer than {MAX_PATH_BYTES} bytes"
-    if any(len(part.encode("utf-8")) > MAX_COMPONENT_BYTES for part in text.split("/")):
-        return f"a component is longer than {MAX_COMPONENT_BYTES} bytes"
-    return None
-
-
-def _windows_violation(parts: list[str]) -> str | None:
-    """Components Windows cannot create: ``safe_component`` already knows its rules."""
-    if any(safe_component(part) != part for part in parts):
-        return "not a valid Windows file name"
-    return None
-
-
-def _violation(text: str) -> str | None:
-    """Why ``text`` is not a plain relative ``/``-separated path, or ``None`` when it is."""
     if not unicodedata.normalize("NFC", text):
         return "empty"
-    if reason := _size_violation(text):
-        return reason
     if _CONTROL_CHARS.search(text):
         return "control character"
-    if "\\" in text:
-        return "backslash"
     if text.startswith("/"):
         return "absolute"
     parts = text.split("/")
@@ -81,9 +73,31 @@ def _violation(text: str) -> str | None:
         return "empty component"
     if _DOT_COMPONENTS & set(parts):
         return "'.' or '..' component"
+    return None
+
+
+def _size_violation(text: str) -> str | None:
+    if len(text.encode("utf-8")) > MAX_PATH_BYTES:
+        return f"longer than {MAX_PATH_BYTES} bytes"
+    if any(len(part.encode("utf-8")) > MAX_COMPONENT_BYTES for part in text.split("/")):
+        return f"a component is longer than {MAX_COMPONENT_BYTES} bytes"
+    return None
+
+
+def _windows_violation(parts: list[str]) -> str | None:
+    """Names only Windows refuses: a separator, a drive letter, characters, device names, trailing dots."""
+    if any("\\" in part for part in parts):
+        return "backslash"
     if _DRIVE_PREFIX.match(parts[0]):
         return "drive letter"
-    return _windows_violation(parts) if IS_WINDOWS else None
+    if any(safe_component(part) != part for part in parts):
+        return "not a valid Windows file name"
+    return None
+
+
+def _unsupported_reason(text: str) -> str | None:
+    """Why this platform cannot create ``text`` though a server may hold it, or ``None`` when it can."""
+    return _size_violation(text) or (_windows_violation(text.split("/")) if IS_WINDOWS else None)
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -97,9 +111,10 @@ class RelPath:
     value: str
 
     def __post_init__(self) -> None:
-        reason = _violation(self.value)
-        if reason is not None:
+        if (reason := _hard_violation(self.value)) is not None:
             raise UnsafePathError(f"unsafe artifact path {self.value!r}: {reason}")
+        if (reason := _unsupported_reason(self.value)) is not None:
+            raise UnsupportedNameError(f"unsupported artifact path {self.value!r}: {reason}")
 
     def __str__(self) -> str:
         return self.value

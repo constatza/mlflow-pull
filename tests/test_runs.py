@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import math
+import sys
+import types
 from collections.abc import Callable
 from pathlib import Path
 
@@ -340,10 +342,10 @@ def test_cli_usage_errors_exit_2(cli: Cli, metric_runs: dict[str, str], args: tu
     assert cli("runs", "-e", "exp", *args).exit_code == 2
 
 
-def test_cli_unknown_experiment_exits_1(cli: Cli, metric_runs: dict[str, str]) -> None:
+def test_cli_unknown_experiment_exits_1(cli: Cli, metric_runs: dict[str, str], assert_fails_cleanly) -> None:
     result = cli("runs", "-e", "no-such-experiment")
 
-    assert result.exit_code == 1
+    assert_fails_cleanly(result, 1)
     assert result.stdout == ""
 
 
@@ -352,6 +354,69 @@ def test_cli_experiment_glob_without_match_exits_3(cli: Cli, metric_runs: dict[s
 
     assert result.exit_code == 3
     assert "no experiment matches" in result.stderr
+
+
+@pytest.mark.parametrize("fmt", ["json", "jsonl", "md-table", "text"])
+def test_cli_experiment_glob_without_match_renders_what_an_empty_selection_renders(
+    cli: Cli, metric_runs: dict[str, str], fmt: str
+) -> None:
+    empty = cli("runs", "-e", "exp", "--tag", "phase=nope", "--format", fmt)
+    result = cli("runs", "-e", "nothing*", "--format", fmt)
+
+    assert result.exit_code == empty.exit_code == 3
+    assert result.stdout == empty.stdout
+    assert "no experiment matches nothing*" in result.stderr
+
+
+def test_cli_a_start_time_no_calendar_holds_fails_with_one_line(
+    cli: Cli, client: MlflowClient, metric_runs: dict[str, str], assert_fails_cleanly
+) -> None:
+    client.create_run(client.get_experiment_by_name("exp").experiment_id, start_time=2**62)
+
+    assert "year" in assert_fails_cleanly(cli("runs", "-e", "exp"), 1)
+
+
+def test_cli_an_overflowing_start_time_fails_with_one_line(
+    cli: Cli, metric_runs: dict[str, str], monkeypatch: pytest.MonkeyPatch, assert_fails_cleanly
+) -> None:
+    def overflow(*_args: object) -> None:
+        raise OverflowError("timestamp out of range for platform time_t")
+
+    monkeypatch.setattr("mlflow_pull.cli.summarise_runs", overflow)
+
+    assert "time_t" in assert_fails_cleanly(cli("runs", "-e", "exp"), 1)
+
+
+def test_cli_boto_errors_fail_with_one_line_when_botocore_is_installed(
+    cli: Cli, metric_runs: dict[str, str], monkeypatch: pytest.MonkeyPatch, assert_fails_cleanly
+) -> None:
+    class BotoCoreError(Exception):
+        pass
+
+    class ClientError(Exception):
+        pass
+
+    botocore = types.ModuleType("botocore")
+    exceptions = types.ModuleType("botocore.exceptions")
+    exceptions.BotoCoreError, exceptions.ClientError = BotoCoreError, ClientError
+    monkeypatch.setitem(sys.modules, "botocore", botocore)
+    monkeypatch.setitem(sys.modules, "botocore.exceptions", exceptions)
+
+    def denied(*_args: object) -> None:
+        raise ClientError("An error occurred (AccessDenied) when calling GetObject")
+
+    monkeypatch.setattr("mlflow_pull.cli.summarise_runs", denied)
+
+    assert "AccessDenied" in assert_fails_cleanly(cli("runs", "-e", "exp"), 1)
+
+
+def test_cli_boto_errors_are_not_mapped_without_botocore(
+    cli: Cli, metric_runs: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setitem(sys.modules, "botocore", None)  # makes the import fail
+    monkeypatch.setattr("mlflow_pull.cli.summarise_runs", lambda *_: (_ for _ in ()).throw(KeyError("boom")))
+
+    assert isinstance(cli("runs", "-e", "exp").exception, KeyError)  # no blanket except Exception
 
 
 # --- CLI edge cases ------------------------------------------------------------------

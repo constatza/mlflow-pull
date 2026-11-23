@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +31,7 @@ from mlflow_pull import (
     UpToDate,
     What,
     download_runs,
+    execute_plan,
     parse_size,
     plan_pull,
     plan_run,
@@ -39,7 +41,7 @@ from mlflow_pull import (
 from mlflow_pull import execute, paths
 from mlflow_pull.execute import MAX_DEPTH, ListingLimitError
 from mlflow_pull.gateway import entry_from_info
-from mlflow_pull.localfs import NotRegularFileError, SizeMismatchError, SymlinkError
+from mlflow_pull.localfs import STALE_TEMP_SECONDS, NotRegularFileError, SizeMismatchError, SymlinkError
 from mlflow_pull.paths import UnsafePathError
 from mlflow_pull.plan import (
     MANIFEST_NAME,
@@ -53,8 +55,9 @@ from mlflow_pull.plan import (
     UnknownSizeError,
     parse_manifest,
 )
-from mlflow_pull.ports import UNKNOWN_SIZE, FileSize, InvalidSizeError, KnownSize
-from mlflow_pull.selection import FINISHED, RunStatus
+from mlflow_pull.ports import UNKNOWN_SIZE, FileSize, InvalidSizeError, KnownSize, UnsupportedEntry
+from mlflow_pull.report import render_outcomes
+from mlflow_pull.selection import FINISHED, RunStatus, allowed_statuses
 from mlflow_pull.tree import RunTarget
 
 POSIX_ONLY = pytest.mark.skipif(sys.platform == "win32", reason="needs real symlinks and FIFOs")
@@ -149,9 +152,9 @@ def _parent_dir(out: Path, store: Store) -> Path:
 
 def _pull(
     gateway: RunGateway, run_ids: list[str], out: Path, options: PullOptions = PullOptions(),
-    allowed: frozenset[str] = FINISHED,
+    allowed: frozenset[str] = FINISHED, jobs: int = execute.DEFAULT_JOBS,
 ):
-    return pull(gateway, resolve_runs(gateway, run_ids, out, allowed), options)
+    return pull(gateway, resolve_runs(gateway, run_ids, out, allowed), options, jobs)
 
 
 def _options(*globs: str, max_bytes: int | None = None) -> PullOptions:
@@ -303,7 +306,7 @@ def test_parse_size_rejects(text: str) -> None:
 
 @pytest.mark.parametrize(
     "text",
-    ["", "../x", "..", "a/../../b", "/abs", "a//b", "a/", "./a", "a/./b", "a\\b", "C:\\x", "C:x", "a\x00b", "a\nb"],
+    ["", "../x", "..", "a/../../b", "/abs", "a//b", "a/", "./a", "a/./b", "a\x00b", "a\nb"],
 )
 def test_rel_path_rejects_hostile_values(text: str) -> None:
     with pytest.raises(UnsafePathError):
@@ -338,7 +341,6 @@ class ListingClient(MlflowClient):
         (FileInfo("/etc/passwd", False, 1), "absolute"),
         (FileInfo("a/../../b", False, 1), r"'\.' or '\.\.' component"),
         (FileInfo("a\x00b", False, 1), "control character"),
-        (FileInfo("a\\b", False, 1), "backslash"),
         (FileInfo("dir", True, None), r"unsafe artifact path 'dir/\.\./\.\./x'"),  # hostile child, below
     ],
 )
@@ -1124,9 +1126,9 @@ def _files(*names: str) -> list[ArtifactFile]:
 
 
 def _plan(store: Store, tmp_path: Path, *names: str, content: Content = Content.parse(["artifacts"]),
-          children: frozenset[str] = frozenset(), path_filter: PathFilter = PathFilter()):
+          children: frozenset[str] = frozenset(), path_filter: PathFilter = PathFilter(), fold_names: bool = True):
     return plan_run(
-        _target(store, tmp_path), _files(*names), UNRECORDED, path_filter, content.reserved, children
+        _target(store, tmp_path), _files(*names), UNRECORDED, path_filter, content.reserved, children, fold_names
     )
 
 
@@ -1363,3 +1365,315 @@ def test_a_symlink_for_a_manifest_to_a_huge_file_is_not_read(
 
     assert counting.downloaded == ["c.txt"]
     assert not manifest.is_symlink() and big.stat().st_size == 64 * 1024**2  # replaced, not written through
+
+
+# --- case and normalisation folding only where the file system folds -----------------------------------------
+
+
+def test_fold_names_is_on_exactly_where_file_systems_fold_names() -> None:
+    from mlflow_pull import plan as plan_module
+
+    assert plan_module.FOLD_NAMES == (sys.platform in ("win32", "darwin"))
+    assert PullOptions().fold_names is plan_module.FOLD_NAMES
+
+
+def test_names_differing_in_case_are_two_files_where_the_file_system_keeps_case(store: Store, tmp_path: Path) -> None:
+    plan = _plan(store, tmp_path, "Model.pkl", "model.pkl", "d/x", "D/x", fold_names=False)
+    assert [f.path.value for f in plan.files] == ["D/x", "Model.pkl", "d/x", "model.pkl"]
+    _plan(store, tmp_path, "Config", "config/a.yaml", fold_names=False)  # a file and a directory, in two cases
+
+
+def test_reserved_names_are_exact_where_the_file_system_keeps_case(store: Store, tmp_path: Path) -> None:
+    both = Content.parse(["metrics,artifacts"])
+    assert len(_plan(store, tmp_path, "RUN.json", ".MLPULL.JSON", content=both, fold_names=False).files) == 2
+    for name in (SUMMARY_NAME, MANIFEST_NAME, f"{SUMMARY_NAME}/x"):
+        with pytest.raises(ReservedNameError, match=r"--path '!"):
+            _plan(store, tmp_path, name, content=both, fold_names=False)
+    child_dir = f"child-{store.child[:8]}"
+    _plan(store, tmp_path, f"{child_dir.upper()}/x", children=frozenset({child_dir}), fold_names=False)
+    with pytest.raises(ReservedNameError, match="nested run"):
+        _plan(store, tmp_path, f"{child_dir}/x", children=frozenset({child_dir}), fold_names=False)
+
+
+def test_unicode_equal_names_still_conflict_where_the_file_system_keeps_case(store: Store, tmp_path: Path) -> None:
+    with pytest.raises(DuplicatePathError, match=r"--path '!"):
+        _plan(store, tmp_path, "é.txt", "é.txt", fold_names=False)
+
+
+def test_both_name_conflicts_say_how_to_leave_one_out(store: Store, tmp_path: Path) -> None:
+    with pytest.raises(DuplicatePathError, match=r"--path '!a\.txt'"):
+        _plan(store, tmp_path, "A.txt", "a.txt")  # the later name is the one to leave out
+    with pytest.raises(ReservedNameError, match=r"--path '!RUN\.json'"):
+        _plan(store, tmp_path, "RUN.json", content=Content.parse(["metrics,artifacts"]))
+
+
+def test_a_clash_found_by_folding_can_be_left_out_with_path(store: Store, tmp_path: Path) -> None:
+    plan = _plan(store, tmp_path, "A.txt", "a.txt", path_filter=PathFilter.parse(["!a.txt"]))
+    assert [f.path.value for f in plan.files] == ["A.txt"]
+
+
+def test_the_fold_setting_reaches_the_plan_of_a_pull(store: Store, tmp_path: Path) -> None:
+    def listing(path: RelPath | None) -> list[ArtifactEntry]:
+        return [ArtifactFile(RelPath("Model.pkl"), KnownSize(1)), ArtifactFile(RelPath("model.pkl"), KnownSize(1))]
+
+    gateway = ScriptedGateway(store.client, listing)
+    resolution = resolve_runs(gateway, [store.child], tmp_path / "out", FINISHED)
+
+    kept = plan_pull(gateway, resolution, PullOptions(fold_names=False))
+    assert len(kept.runs[0].files) == 2
+    with pytest.raises(DuplicatePathError):
+        plan_pull(gateway, resolution, PullOptions(fold_names=True))
+
+
+# --- names this platform cannot hold are reported, not fatal -------------------------------------------------
+
+
+def _unsupported_listing(path: RelPath | None) -> list[ArtifactEntry]:
+    assert path is None, f"the unsupported directory must not be listed: {path}"
+    return [
+        ArtifactFile(RelPath("c.txt"), KnownSize(7)),
+        UnsupportedEntry.named("k:3.json"),
+        UnsupportedEntry.named("too-long-dir"),
+    ]
+
+
+def test_unsupported_entries_are_skipped_counted_and_never_listed(store: Store, tmp_path: Path) -> None:
+    gateway = ScriptedGateway(store.client, _unsupported_listing)
+    out = tmp_path / "out"
+
+    first, second = (_pull(gateway, [store.child], out) + _pull(gateway, [store.child], out))
+
+    assert isinstance(first, Downloaded) and (first.files, first.unsupported) == (1, 2)
+    assert isinstance(second, UpToDate) and second.unsupported == 2
+    assert gateway.listed == [None, None]  # the directory entry pruned its subtree
+    assert _tree(out / f"child-{store.child[:8]}") == frozenset({"c.txt"})
+
+
+def test_unsupported_entries_are_reported_like_other_unsupported_names(store: Store, tmp_path: Path) -> None:
+    gateway = ScriptedGateway(store.client, _unsupported_listing)
+    plan = plan_pull(gateway, resolve_runs(gateway, [store.child], tmp_path / "out", FINISHED))
+
+    (run,) = plan.runs
+    assert plan.unsupported == 2
+    assert sorted(str(entry.path.under(run.target.dir).relative_to(tmp_path / "out")) for entry in run.unsupported) == [
+        f"child-{store.child[:8]}/k:3.json",
+        f"child-{store.child[:8]}/too-long-dir",
+    ]
+
+
+def test_path_can_leave_an_unsupported_entry_out_of_the_count(store: Store, tmp_path: Path) -> None:
+    gateway = ScriptedGateway(store.client, _unsupported_listing)
+    plan = plan_pull(
+        gateway, resolve_runs(gateway, [store.child], tmp_path / "out", FINISHED), _options("!k:3.json", "!too-long-dir")
+    )
+    assert plan.unsupported == 0 and len(plan.runs[0].files) == 1
+
+
+def test_a_hostile_name_among_unsupported_ones_still_fails_the_listing(store: Store, tmp_path: Path) -> None:
+    client = ListingClient(tracking_uri=store.client.tracking_uri)
+    client.listing = {"": [FileInfo("a" * 300, False, 1), FileInfo("../x", False, 1)]}
+    with pytest.raises(UnsafePathError):
+        download_runs(MlflowGateway(client), [store.parent], tmp_path / "out")
+
+
+def test_a_real_gateway_listing_with_a_long_name_is_reported_not_fatal(store: Store, tmp_path: Path) -> None:
+    client = ListingClient(tracking_uri=store.client.tracking_uri)
+    client.listing = {"": [FileInfo("a" * 300, False, 1), FileInfo("d" * 300, True, None)]}
+    gateway = MlflowGateway(client)
+
+    plan = plan_pull(gateway, resolve_runs(gateway, [store.child], tmp_path / "out", FINISHED))
+
+    assert plan.unsupported == 2 and plan.fetch_files == 0
+
+
+# --- progress survives a failure -------------------------------------------------------------------------------
+
+
+class FlakyGateway(CountingGateway):
+    """Fails the download of one named file, once."""
+
+    def __init__(self, client: MlflowClient, fail_on: str) -> None:
+        super().__init__(client)
+        self.fail_on = fail_on
+
+    def download_artifact(self, run_id: str, path: RelPath, dest_dir: Path) -> None:
+        if path.value == self.fail_on:
+            raise ConnectionError("the server went away")
+        super().download_artifact(run_id, path, dest_dir)
+
+
+LAST_FILE = sorted(SIZES)[-1]
+
+
+def test_a_failure_on_the_last_file_keeps_the_manifest_of_the_files_before_it(
+    store: Store, counting: CountingGateway, tmp_path: Path
+) -> None:
+    out = tmp_path / "out"
+    flaky = FlakyGateway(store.client, LAST_FILE)
+
+    with pytest.raises(ConnectionError, match="went away"):
+        _pull(flaky, [store.parent], out, jobs=1)
+
+    recorded = json.loads((_parent_dir(out, store) / MANIFEST_NAME).read_text())["files"]
+    assert set(recorded) == set(SIZES) - {LAST_FILE}
+
+    _pull(counting, [store.parent], out)
+
+    assert [name for name in counting.downloaded if name != "c.txt"] == [LAST_FILE]  # only what was missing
+    assert _tree(_parent_dir(out, store)) == EVERYTHING_PULLED | {"child-" + store.child[:8] + "/c.txt"}
+
+
+def test_a_failing_manifest_write_does_not_hide_the_download_error(
+    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(path: Path, text: str) -> None:
+        raise OSError("disk on fire")
+
+    monkeypatch.setattr(execute, "write_atomically", refuse)
+
+    with pytest.raises(ConnectionError, match="went away"):
+        _pull(FlakyGateway(store.client, LAST_FILE), [store.parent], tmp_path / "out", jobs=1)
+
+
+def test_a_failure_before_any_file_landed_writes_no_manifest(store: Store, tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    with pytest.raises(ConnectionError):
+        _pull(FlakyGateway(store.client, sorted(SIZES)[0]), [store.parent], out, jobs=1)
+    assert not (_parent_dir(out, store) / MANIFEST_NAME).exists()
+
+
+# --- a running run grows between listing and download ----------------------------------------------------------
+
+
+class GrowingGateway(CountingGateway):
+    """The run appends to its artifact after the listing: more bytes land than were listed."""
+
+    def download_artifact(self, run_id: str, path: RelPath, dest_dir: Path) -> None:
+        super().download_artifact(run_id, path, dest_dir)
+        with path.under(dest_dir).open("a") as handle:
+            handle.write("more")
+
+
+RUNNING_ALLOWED = allowed_statuses(unfinished=True)
+
+
+def test_a_running_run_that_grew_is_a_warning_not_a_failure(store: Store, tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    gateway = GrowingGateway(store.client)
+
+    outcomes = _pull(gateway, [store.live], out, allowed=RUNNING_ALLOWED)
+
+    (outcome,) = outcomes
+    assert isinstance(outcome, Downloaded) and outcome.changed_during_pull == 1
+    assert ", 1 file(s) changed while pulling" in render_outcomes(outcomes, out)
+    assert (out / f"live-{store.live[:8]}" / "l.txt").read_text() == "xxxmore"
+    manifest = json.loads((out / f"live-{store.live[:8]}" / MANIFEST_NAME).read_text())
+    assert manifest["files"] == {}  # nothing vouches for the file
+
+
+def test_a_finished_run_that_changed_size_is_still_an_error(store: Store, tmp_path: Path) -> None:
+    with pytest.raises(SizeMismatchError, match=r"c\.txt"):
+        _pull(GrowingGateway(store.client), [store.child], tmp_path / "out")
+
+
+def test_outcomes_without_changes_report_none(store: Store, gateway: RunGateway, tmp_path: Path) -> None:
+    (outcome,) = _pull(gateway, [store.live], tmp_path / "out", allowed=RUNNING_ALLOWED)
+    assert isinstance(outcome, Downloaded) and outcome.changed_during_pull == 0
+
+
+# --- stores that report no size ----------------------------------------------------------------------------------
+
+
+class UnsizedGateway(CountingGateway):
+    def list_artifacts(self, run_id: str, path: RelPath | None):
+        return [
+            ArtifactFile(entry.path, UNKNOWN_SIZE) if isinstance(entry, ArtifactFile) else entry
+            for entry in super().list_artifacts(run_id, path)
+        ]
+
+
+def test_unknown_listed_sizes_do_not_refetch_an_intact_file_of_a_finished_run(store: Store, tmp_path: Path) -> None:
+    gateway = UnsizedGateway(store.client)
+    out = tmp_path / "out"
+    _pull(gateway, [store.child], out)
+    gateway.downloaded.clear()
+
+    (outcome,) = _pull(gateway, [store.child], out)
+
+    assert gateway.downloaded == [] and isinstance(outcome, UpToDate) and outcome.files == 1
+
+
+def test_an_unknown_size_file_that_changed_on_disk_is_fetched_again(store: Store, tmp_path: Path) -> None:
+    gateway = UnsizedGateway(store.client)
+    out = tmp_path / "out"
+    _pull(gateway, [store.child], out)
+    target = out / f"child-{store.child[:8]}" / "c.txt"
+    target.write_text("y" * 7)
+    os.utime(target, ns=(0, target.stat().st_mtime_ns + 10**9))
+    gateway.downloaded.clear()
+
+    _pull(gateway, [store.child], out)
+
+    assert gateway.downloaded == ["c.txt"]
+
+
+def test_an_unknown_size_is_not_trusted_for_a_run_that_is_not_finished(store: Store, tmp_path: Path) -> None:
+    live = RunTarget(store.client.get_run(store.live), tmp_path / "live")
+    finished = RunTarget(store.client.get_run(store.child), tmp_path / "child")
+    listing = [ArtifactFile(RelPath("f"), UNKNOWN_SIZE)]
+
+    def plan(target: RunTarget):
+        recorded = Manifest(target.run.info.run_id, RunStatus.FINISHED, {RelPath("f"): OnDiskFile(3, 9)})
+        return plan_run(target, listing, recorded, PathFilter(), Content.parse(["artifacts"]).reserved)
+
+    assert [f.path.value for f in plan(finished).up_to_date] == ["f"]
+    assert [f.path.value for f in plan(live).files] == ["f"]
+
+
+def test_max_size_still_refuses_unknown_sizes_that_must_be_fetched(
+    store: Store, tmp_path: Path
+) -> None:
+    gateway = UnsizedGateway(store.client)
+    with pytest.raises(UnknownSizeError):
+        _pull(gateway, [store.child], tmp_path / "out", _options(max_bytes=10**6))
+
+
+# --- a run directory that is a symlink -------------------------------------------------------------------------------
+
+
+@POSIX_ONLY
+def test_a_symlinked_run_directory_is_not_up_to_date(store: Store, counting: CountingGateway, tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    _pull(counting, [store.child], out)
+    run_dir = out / f"child-{store.child[:8]}"
+    elsewhere = tmp_path / "elsewhere"
+    run_dir.rename(elsewhere)
+    run_dir.symlink_to(elsewhere)  # the old manifest and files are reachable through the link
+    counting.downloaded.clear()
+    resolution = resolve_runs(counting, [store.child], out, FINISHED)
+
+    plan = plan_pull(counting, resolution)
+    assert [f.path.value for f in plan.runs[0].files] == ["c.txt"] and plan.runs[0].up_to_date == ()
+
+    with pytest.raises(SymlinkError):
+        execute_plan(counting, plan)
+
+    assert counting.downloaded == []
+
+
+# --- a crashed write leaves a temporary file behind ------------------------------------------------------------------
+
+
+def test_a_pull_removes_old_leftovers_of_its_own_atomic_writes(store: Store, gateway: RunGateway, tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    _pull(gateway, [store.child], out)
+    run_dir = out / f"child-{store.child[:8]}"
+    stale = run_dir / f".mlpull-{MANIFEST_NAME}.crashed.tmp"
+    stale.write_text("{")
+    old = time.time() - 2 * STALE_TEMP_SECONDS
+    os.utime(stale, (old, old))
+    (run_dir / "c.txt").unlink()  # something to fetch, so the run executes
+
+    _pull(gateway, [store.child], out)
+
+    assert not stale.exists() and (run_dir / "c.txt").exists()

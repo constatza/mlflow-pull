@@ -8,15 +8,16 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
 
-from mlflow_pull.paths import RelPath, UnsafePathError, fold
+from mlflow_pull.paths import FOLD_NAMES, RelPath, UnsafePathError, fold
 from mlflow_pull.pathfilter import EVERYTHING, PathFilter
-from mlflow_pull.ports import ArtifactFile, KnownSize, UnknownSize, can_fetch
+from mlflow_pull.ports import ArtifactFile, KnownSize, UnknownSize, UnsupportedEntry, can_fetch
 from mlflow_pull.selection import RunStatus, allowed_statuses
 from mlflow_pull.tree import RunTarget
 
@@ -82,6 +83,7 @@ class PullOptions:
     content: Content = ARTIFACTS_ONLY
     path_filter: PathFilter = EVERYTHING
     max_bytes: int | None = None
+    fold_names: bool = FOLD_NAMES  # whether names differing in case or Unicode form are one file on the target
 
 
 # --- sizes --------------------------------------------------------------------------------
@@ -222,7 +224,7 @@ class ReservedNameError(PlanConflictError):
 
 
 class DuplicatePathError(PlanConflictError):
-    """Two artifacts are the same file on a case-insensitive or Unicode-normalising file system."""
+    """Two artifacts are the same file: equal in Unicode, or on a case-insensitive file system in case too."""
 
 
 class PrefixConflictError(PlanConflictError):
@@ -234,8 +236,13 @@ class RunPlan:
     target: RunTarget
     files: tuple[ArtifactFile, ...]  # to fetch
     up_to_date: tuple[ArtifactFile, ...]  # recorded, intact, same size: skipped
-    unsupported: tuple[ArtifactFile, ...]  # wanted, but MLflow cannot download that name: skipped
+    unsupported: tuple[UnsupportedEntry, ...]  # wanted, but this machine or MLflow cannot take that name: skipped
     kept: Mapping[RelPath, OnDiskFile]  # recorded files that stay: the up to date ones and those out of scope
+
+    @property
+    def run_status(self) -> RunStatus:
+        """The run's status when it was listed."""
+        return RunStatus.parse(self.target.run.info.status)
 
     @property
     def fetch_bytes(self) -> int:
@@ -262,12 +269,19 @@ def _reusable(recorded: Recorded, run_id: str) -> Mapping[RelPath, OnDiskFile]:
     return recorded.files
 
 
-def _check_names(run_id: str, paths: Iterable[RelPath], reserved: frozenset[RelPath], nested: frozenset[str]) -> None:
-    """Refuse artifacts that would land on a name mlpull owns; names compare case- and normalisation-folded."""
-    owned = {fold(name.value) for name in reserved}
-    runs = {fold(name) for name in nested}
+def _key(text: str, fold_names: bool) -> str:
+    """What decides that two names are one file: always Unicode-equal, and case-folded where the target folds."""
+    return fold(text) if fold_names else unicodedata.normalize("NFC", text)
+
+
+def _check_names(
+    run_id: str, paths: Iterable[RelPath], reserved: frozenset[RelPath], nested: frozenset[str], fold_names: bool
+) -> None:
+    """Refuse artifacts that would land on a name mlpull owns."""
+    owned = {_key(name.value, fold_names) for name in reserved}
+    runs = {_key(name, fold_names) for name in nested}
     for path in sorted(paths):
-        top = fold(path.parts[0])
+        top = _key(path.parts[0], fold_names)
         if top in owned:
             raise ReservedNameError(
                 f"run {run_id}: artifact {path} collides with a file mlpull writes; skip it with --path '!{path}'"
@@ -279,30 +293,35 @@ def _check_names(run_id: str, paths: Iterable[RelPath], reserved: frozenset[RelP
             )
 
 
-def _check_layout(run_id: str, paths: Iterable[RelPath]) -> None:
+def _check_layout(run_id: str, paths: Iterable[RelPath], fold_names: bool) -> None:
     """Refuse two artifacts that are one file, or a file that is also another artifact's directory."""
-    folded: dict[str, RelPath] = {}
+    keyed: dict[str, RelPath] = {}
     for path in sorted(paths):
-        key = fold(path.value)
-        if key in folded:
+        key = _key(path.value, fold_names)
+        if key in keyed:
             raise DuplicatePathError(
-                f"run {run_id}: artifacts {folded[key]} and {path} are the same file after case/Unicode folding"
+                f"run {run_id}: artifacts {keyed[key]} and {path} are the same file after "
+                f"{'case/' if fold_names else ''}Unicode folding; skip one with --path '!{path}'"
             )
-        folded[key] = path
-    for key, path in folded.items():
+        keyed[key] = path
+    for key, path in keyed.items():
         parts = key.split("/")
         for length in range(1, len(parts)):
-            if (ancestor := folded.get("/".join(parts[:length]))) is not None:
-                raise PrefixConflictError(f"run {run_id}: artifact {ancestor} is a file but {path} needs it as a directory")
+            if (ancestor := keyed.get("/".join(parts[:length]))) is not None:
+                raise PrefixConflictError(
+                    f"run {run_id}: artifact {ancestor} is a file but {path} needs it as a directory; "
+                    f"skip one with --path '!{path}'"
+                )
 
 
 def plan_run(
     target: RunTarget,
-    listing: Iterable[ArtifactFile],
+    listing: Iterable[ArtifactFile | UnsupportedEntry],
     recorded: Recorded,
     path_filter: PathFilter,
     reserved: frozenset[RelPath],
     nested: frozenset[str] = frozenset(),
+    fold_names: bool = FOLD_NAMES,
 ) -> RunPlan:
     """Diff the run's listing against the manifest, file by file.
 
@@ -310,25 +329,38 @@ def plan_run(
     stay in the new manifest, so a later pull with another ``--path`` set fetches only what is missing.
     ``nested`` holds the directory names of the run's direct nested runs: artifacts must not land there.
     Names are checked on the files the filter accepts, so ``--path '!NAME'`` is the way out of a clash.
+    ``fold_names`` says whether names differing in case count as one file (case-insensitive targets).
     """
     run_id = target.run.info.run_id
-    accepted = {f.path: f for f in listing if path_filter.accepts(f.path)}
+    entries = tuple(listing)
+    accepted = {f.path: f for f in entries if isinstance(f, ArtifactFile) and path_filter.accepts(f.path)}
     wanted = {path: f for path, f in accepted.items() if can_fetch(path)}
-    _check_names(run_id, wanted, reserved, nested)
-    _check_layout(run_id, wanted)
+    _check_names(run_id, wanted, reserved, nested, fold_names)
+    _check_layout(run_id, wanted, fold_names)
     known = _reusable(recorded, run_id)
+    terminal = RunStatus.parse(target.run.info.status).terminal
     ordered = [wanted[path] for path in sorted(wanted)]
-    up_to_date = tuple(f for f in ordered if _unchanged(known.get(f.path), f))
-    fetched = tuple(f for f in ordered if not _unchanged(known.get(f.path), f))
-    unsupported = tuple(accepted[path] for path in sorted(accepted.keys() - wanted.keys()))
+    up_to_date = tuple(f for f in ordered if _unchanged(known.get(f.path), f, terminal))
+    fetched = tuple(f for f in ordered if not _unchanged(known.get(f.path), f, terminal))
+    skipped = {
+        e.path.text: e for e in entries if isinstance(e, UnsupportedEntry) and path_filter.accepts_name(e.path.text)
+    } | {path.value: UnsupportedEntry.named(path.value) for path in accepted.keys() - wanted.keys()}
     carried = {path: found for path, found in known.items() if not path_filter.accepts(path)}
     kept = carried | {f.path: known[f.path] for f in up_to_date}
-    return RunPlan(target, fetched, up_to_date, unsupported, kept)
+    return RunPlan(target, fetched, up_to_date, tuple(skipped[name] for name in sorted(skipped)), kept)
 
 
-def _unchanged(on_disk: OnDiskFile | None, listed: ArtifactFile) -> bool:
-    """The file on disk is the recorded one (``on_disk`` is ``None`` when not) and the server still lists its size."""
-    return on_disk is not None and isinstance(listed.size, KnownSize) and listed.size.bytes == on_disk.size
+def _unchanged(on_disk: OnDiskFile | None, listed: ArtifactFile, run_terminal: bool) -> bool:
+    """The file on disk is the recorded one (``on_disk`` is ``None`` when not) and still looks the same.
+
+    A listed size must equal the recorded one. A store that lists no size cannot say, so the intact file
+    is trusted only while the run is finished and so no longer changes.
+    """
+    if on_disk is None:
+        return False
+    if isinstance(listed.size, KnownSize):
+        return listed.size.bytes == on_disk.size
+    return run_terminal
 
 
 @dataclass(frozen=True, slots=True)
@@ -370,6 +402,7 @@ class Downloaded:
     files: int
     bytes: int
     unsupported: int
+    changed_during_pull: int = 0  # files of a still-running run that grew after they were listed: left unrecorded
 
 
 @dataclass(frozen=True, slots=True)
@@ -403,9 +436,9 @@ def _up_to_date(plan: RunPlan) -> UpToDate:
     return UpToDate(plan.target, len(plan.up_to_date), plan.up_to_date_bytes, len(plan.unsupported))
 
 
-def outcome_of(plan: RunPlan, content: Content) -> RunOutcome:
+def outcome_of(plan: RunPlan, content: Content, changed_during_pull: int = 0) -> RunOutcome:
     if _writes(plan, content):
-        return Downloaded(plan.target, len(plan.files), plan.fetch_bytes, len(plan.unsupported))
+        return Downloaded(plan.target, len(plan.files), plan.fetch_bytes, len(plan.unsupported), changed_during_pull)
     return _up_to_date(plan)
 
 

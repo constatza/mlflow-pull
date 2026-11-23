@@ -51,6 +51,11 @@ def unsupported_note(count: int) -> str:
     return f", {count} unsupported name(s) skipped" if count else ""
 
 
+def changed_note(count: int) -> str:
+    """``, 2 file(s) changed while pulling``, or nothing: files of a running run that grew after they were listed."""
+    return f", {count} file(s) changed while pulling" if count else ""
+
+
 def _run_lines(plan: RunPlan, root: Path, writes_summary: bool) -> list[str]:
     target = plan.target
     head = (
@@ -80,6 +85,7 @@ def render_outcomes(outcomes: Sequence[RunOutcome], out: Path) -> str:
     size = format_bytes(sum(o.bytes for o in downloaded))
     line = f"Downloaded {len(downloaded)} run(s), {files} file(s), {size} to {out.resolve()}"
     line += unsupported_note(sum(o.unsupported for o in outcomes))
+    line += changed_note(sum(o.changed_during_pull for o in downloaded))
     return line + (f" ({len(current)} run(s) already up to date)" if current else "")
 
 

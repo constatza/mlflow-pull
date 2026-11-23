@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import os
+import signal
 import socket
+import subprocess
 import sys
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -254,6 +257,15 @@ srv = socket.create_server(("127.0.0.1", int(port)))
 while True:
     srv.accept()[0].close()
 """
+_FAKE_SSH_RECORD_PID = """
+import os, socket, sys
+with open(os.environ["FAKE_SSH_PID_FILE"], "w") as pid_file:
+    pid_file.write(str(os.getpid()))
+port = sys.argv[sys.argv.index("-L") + 1].split(":")[1]
+srv = socket.create_server(("127.0.0.1", int(port)))
+while True:
+    srv.accept()[0].close()
+"""
 _FAKE_SSH_FAIL = """
 import sys
 sys.stderr.write("Permission denied (publickey).\\n")
@@ -305,3 +317,105 @@ def test_tunnel_reports_ssh_failure(fake_ssh) -> None:
     with pytest.raises(SystemExit, match="Permission denied"):
         with ssh_tunnel(SshHost("test.invalid")):
             pass
+
+
+TUNNEL_HOLDER = """
+import sys
+from mlflow_pull import SshHost, ssh_tunnel
+with ssh_tunnel(SshHost("test.invalid"), timeout=10) as uri:
+    print("ready", flush=True)
+    sys.stdin.read()
+"""
+SIGTERM_EXIT_CODE = 128 + signal.SIGTERM
+WAIT_S = 15.0
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM and a shebang fake ssh are POSIX")
+def test_sigterm_closes_the_tunnel_instead_of_orphaning_ssh(
+    fake_ssh, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pid_file = tmp_path / "ssh.pid"
+    monkeypatch.setenv("FAKE_SSH_PID_FILE", str(pid_file))
+    fake_ssh(_FAKE_SSH_RECORD_PID)
+    holder = subprocess.Popen(
+        [sys.executable, "-c", TUNNEL_HOLDER], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
+    )
+    ssh_pid = None
+    try:
+        assert holder.stdout.readline().strip() == "ready"
+        ssh_pid = int(pid_file.read_text())
+        holder.send_signal(signal.SIGTERM)
+
+        assert holder.wait(WAIT_S) == SIGTERM_EXIT_CODE
+        assert not _alive(ssh_pid)
+    finally:
+        holder.kill()
+        holder.wait()
+        if ssh_pid is not None and _alive(ssh_pid):
+            os.kill(ssh_pid, signal.SIGKILL)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM and a shebang fake ssh are POSIX")
+def test_the_sigterm_handler_lives_only_while_the_tunnel_is_open(fake_ssh) -> None:
+    fake_ssh(_FAKE_SSH_LISTEN)
+    before = signal.getsignal(signal.SIGTERM)
+
+    with ssh_tunnel(SshHost("test.invalid")):
+        assert signal.getsignal(signal.SIGTERM) is not before
+    assert signal.getsignal(signal.SIGTERM) is before
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="fake ssh is a shebang script")
+def test_a_tunnel_opened_off_the_main_thread_leaves_signals_alone(fake_ssh) -> None:
+    fake_ssh(_FAKE_SSH_LISTEN)
+    before = signal.getsignal(signal.SIGTERM)
+    seen: list[object] = []
+
+    def open_tunnel() -> None:
+        with ssh_tunnel(SshHost("test.invalid")):
+            seen.append(signal.getsignal(signal.SIGTERM))
+
+    worker = threading.Thread(target=open_tunnel)
+    worker.start()
+    worker.join(WAIT_S)
+
+    assert seen == [before]
+
+
+def test_a_missing_ssh_binary_fails_with_one_line(
+    cli, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, assert_fails_cleanly
+) -> None:
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+
+    assert "ssh" in assert_fails_cleanly(cli("run", "x", "--ssh", "test.invalid"), 1)
+
+
+def test_a_failing_ssh_fails_with_one_line(cli, fake_ssh, assert_fails_cleanly) -> None:
+    fake_ssh(_FAKE_SSH_FAIL)
+
+    assert "Permission denied" in assert_fails_cleanly(cli("run", "x", "--ssh", "test.invalid"), 1)
+
+
+def test_no_free_local_port_fails_with_one_line(cli, monkeypatch: pytest.MonkeyPatch, assert_fails_cleanly) -> None:
+    def refuse() -> int:
+        raise OSError("no free port")
+
+    monkeypatch.setattr("mlflow_pull.tunnel._free_port", refuse)
+
+    assert "no free port" in assert_fails_cleanly(cli("run", "x", "--ssh", "test.invalid"), 1)
+
+
+def test_parse_when_accepts_a_trailing_z() -> None:
+    now = datetime(2026, 11, 23, tzinfo=timezone.utc)
+
+    assert parse_when("2026-11-23T10:00:00Z", now) == datetime(2026, 11, 23, 10, tzinfo=timezone.utc)

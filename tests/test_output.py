@@ -192,10 +192,10 @@ def test_an_experiment_glob_without_match_exits_3(store: Store, cli: Cli, tmp_pa
     assert "no experiment matches nothing*" in result.stderr
 
 
-def test_an_unknown_experiment_name_exits_1(store: Store, cli: Cli, tmp_path: Path) -> None:
+def test_an_unknown_experiment_name_exits_1(store: Store, cli: Cli, tmp_path: Path, assert_fails_cleanly) -> None:
     result = cli("experiment", "no-such-experiment", "-o", str(_out(tmp_path)))
 
-    assert result.exit_code == ExitCode.REFUSED
+    assert_fails_cleanly(result, ExitCode.REFUSED)
 
 
 @pytest.mark.parametrize("fmt", ["text", "jsonl"])
@@ -208,19 +208,18 @@ def test_a_refused_status_exits_1_and_writes_no_record(store: Store, cli: Cli, t
     assert result.stdout == "" and not out.exists()
 
 
-def test_a_size_refusal_exits_1(store: Store, cli: Cli, tmp_path: Path) -> None:
+def test_a_size_refusal_exits_1(store: Store, cli: Cli, tmp_path: Path, assert_fails_cleanly) -> None:
     result = cli("run", store.parent, "--max-size", "5", "--format", "jsonl", "-o", str(_out(tmp_path)))
 
-    assert result.exit_code == ExitCode.REFUSED
-    assert result.stdout == "" and "refused (--max-size)" in result.stderr
+    assert "refused (--max-size)" in assert_fails_cleanly(result, ExitCode.REFUSED, notes_before=True)
+    assert result.stdout == ""
 
 
-def test_a_reserved_artifact_name_exits_1(store: Store, cli: Cli, tmp_path: Path) -> None:
+def test_a_reserved_artifact_name_exits_1(store: Store, cli: Cli, tmp_path: Path, assert_fails_cleanly) -> None:
     store.client.log_text(store.child, "mine", MANIFEST_NAME)
     result = cli("run", store.child, "-o", str(_out(tmp_path)))
 
-    assert result.exit_code == ExitCode.REFUSED
-    assert "collides" in result.stderr
+    assert "collides" in assert_fails_cleanly(result, ExitCode.REFUSED)
 
 
 def test_a_pull_with_everything_up_to_date_exits_0(store: Store, cli: Cli, tmp_path: Path) -> None:
@@ -239,10 +238,14 @@ def test_a_pull_with_everything_up_to_date_exits_0(store: Store, cli: Cli, tmp_p
         (("--format", "jsonl", "-e", "no-such-experiment"), ExitCode.REFUSED, ""),
     ],
 )
-def test_runs_exit_codes(store: Store, cli: Cli, args: tuple[str, ...], code: ExitCode, stdout: str | None) -> None:
+def test_runs_exit_codes(
+    store: Store, cli: Cli, assert_fails_cleanly, args: tuple[str, ...], code: ExitCode, stdout: str | None
+) -> None:
     result = cli("runs", *args)
 
     assert result.exit_code == code
+    if code is ExitCode.REFUSED:
+        assert_fails_cleanly(result, code)
     if stdout is not None:
         assert result.stdout == stdout
 

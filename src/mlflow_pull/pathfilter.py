@@ -68,7 +68,10 @@ class Glob:
         return cls(segments)
 
     def matches(self, path: RelPath) -> bool:
-        return _path_regex(self.segments).fullmatch(path.value) is not None
+        return self.matches_text(path.value)
+
+    def matches_text(self, text: str) -> bool:
+        return _path_regex(self.segments).fullmatch(text) is not None
 
     def may_match_below(self, directory: RelPath) -> bool:
         """Whether some path strictly inside ``directory`` can match; ``False`` only when provably none can."""
@@ -101,8 +104,12 @@ class PathFilter:
         return cls(tuple(map(Glob.parse, included)), tuple(map(Glob.parse, excluded)))
 
     def accepts(self, path: RelPath) -> bool:
-        included = not self.includes or any(glob.matches(path) for glob in self.includes)
-        return included and not any(glob.matches(path) for glob in self.excludes)
+        return self.accepts_name(path.value)
+
+    def accepts_name(self, text: str) -> bool:
+        """``accepts`` for a name that is not a ``RelPath`` (an unsupported one, reported but never written)."""
+        included = not self.includes or any(glob.matches_text(text) for glob in self.includes)
+        return included and not any(glob.matches_text(text) for glob in self.excludes)
 
     def descends_into(self, directory: RelPath) -> bool:
         """Whether listing ``directory`` can find an accepted file: the only test that prunes the walk."""

@@ -64,6 +64,41 @@ class ArtifactDir:
 
 ArtifactEntry = ArtifactFile | ArtifactDir
 
+
+@dataclass(frozen=True, slots=True)
+class UnsupportedName:
+    """A name the server holds that this machine cannot write, kept as text for reports only.
+
+    It is not a ``RelPath``: nothing can be written or read through it. The listing boundary has
+    already refused hostile names, so ``under`` is only ever used to print where the name would go.
+    """
+
+    text: str
+
+    @property
+    def parts(self) -> tuple[str, ...]:
+        return tuple(self.text.split("/"))
+
+    def is_child_of(self, directory: RelPath | None) -> bool:
+        return self.parts[:-1] == (() if directory is None else directory.parts)
+
+    def under(self, root: Path) -> Path:
+        return root.joinpath(*self.parts)
+
+
+@dataclass(frozen=True, slots=True)
+class UnsupportedEntry:
+    """A listed file or directory the plan skips and counts: a directory's subtree is never listed."""
+
+    path: UnsupportedName
+
+    @classmethod
+    def named(cls, text: str) -> UnsupportedEntry:
+        return cls(UnsupportedName(text))
+
+
+ListedEntry = ArtifactFile | ArtifactDir | UnsupportedEntry
+
 # MLflow downloads through a ``runs:/<id>/<path>`` URI. Downloads of names with ``#`` or ``?`` fail (the
 # URI parser cuts the path there) and ``%41`` looks up ``A`` instead (checked against MLflow 3.17).
 _UNFETCHABLE = re.compile(r"[#?]|%[0-9A-Fa-f]{2}")
@@ -88,11 +123,11 @@ class RunGateway(Protocol):
     def metric_history(self, run_id: str, key: str) -> list[Metric]:
         """Every logged point of one metric of the run."""
 
-    def list_artifacts(self, run_id: str, path: RelPath | None) -> list[ArtifactEntry]:
+    def list_artifacts(self, run_id: str, path: RelPath | None) -> list[ListedEntry]:
         """The direct children of the artifact directory ``path`` (``None``: the run root).
 
         Paths are relative to the run root and validated, so a hostile listing raises
-        ``UnsafePathError`` here.
+        ``UnsafePathError`` here; a harmless name this machine cannot create is an ``UnsupportedEntry``.
         """
 
     def download_artifact(self, run_id: str, path: RelPath, dest_dir: Path) -> None:

@@ -9,9 +9,11 @@ A process that can swap a directory for a symlink between the check and the down
 from __future__ import annotations
 
 import contextlib
+import errno
 import os
+import secrets
 import stat
-import tempfile
+import time
 from pathlib import Path
 
 from mlflow_pull.paths import RelPath, UnsafePathError, require_within
@@ -24,6 +26,12 @@ _READ_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLO
 _ENCODING = "utf-8"
 _TEMP_PREFIX = ".mlpull-"
 _TEMP_SUFFIX = ".tmp"
+_TEMP_TOKEN_BYTES = 8
+_TEMP_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+_NEW_FILE_MODE = 0o666  # the umask trims it, as it does for downloaded artifacts
+STALE_TEMP_SECONDS = 3600  # a write takes milliseconds: an hour-old temporary file is from a crash
+# Some NFS, SMB and FUSE mounts cannot fsync a directory; nothing is wrong with the write then.
+_UNSYNCABLE_DIRECTORY = frozenset({errno.EINVAL, errno.ENOTSUP, errno.EBADF})
 
 
 class SymlinkError(UnsafePathError):
@@ -49,6 +57,25 @@ def _kind(path: Path) -> int | None:
 def _refuse_symlink(path: Path, mode: int) -> None:
     if stat.S_ISLNK(mode):
         raise SymlinkError(f"{path} is a symlink; mlpull does not write through symlinks")
+
+
+def is_plain_directory(root: Path, directory: Path) -> bool:
+    """Whether every component of ``directory`` below ``root`` is a real directory: no symlink, nothing missing.
+
+    The root and what lies above it are the user's choice and may be links.
+    """
+    base = Path(os.path.abspath(root))
+    current = base
+    try:
+        parts = Path(os.path.abspath(directory)).relative_to(base).parts
+    except ValueError:
+        return False
+    for part in parts:
+        current = current / part
+        mode = _kind(current)
+        if mode is None or not stat.S_ISDIR(mode):  # lstat: a link to a directory is S_ISLNK, not S_ISDIR
+            return False
+    return True
 
 
 def ensure_directory(root: Path, directory: Path) -> None:
@@ -148,17 +175,46 @@ def _sync_directory(directory: Path) -> None:
     descriptor = os.open(directory, os.O_RDONLY)
     try:
         os.fsync(descriptor)
+    except OSError as err:
+        if err.errno not in _UNSYNCABLE_DIRECTORY:
+            raise
     finally:
         os.close(descriptor)
+
+
+def _is_stale_temp_file(entry: os.DirEntry[str], now: float) -> bool:
+    """One of our own leftovers: our name pattern, a regular file (not a link), untouched for a long time."""
+    if not (entry.name.startswith(_TEMP_PREFIX) and entry.name.endswith(_TEMP_SUFFIX)):
+        return False
+    try:
+        found = entry.stat(follow_symlinks=False)
+    except OSError:
+        return False
+    return stat.S_ISREG(found.st_mode) and now - found.st_mtime > STALE_TEMP_SECONDS
+
+
+def remove_stale_temp_files(directory: Path) -> None:
+    """Delete the temporary files an earlier crashed write left directly in ``directory``; best effort."""
+    now = time.time()
+    try:
+        with os.scandir(directory) as entries:
+            stale = [Path(entry.path) for entry in entries if _is_stale_temp_file(entry, now)]
+    except OSError:
+        return
+    for path in stale:
+        with contextlib.suppress(OSError):
+            path.unlink()
 
 
 def write_atomically(path: Path, text: str) -> None:
     """Never leave a half-written file under the final name, and never write through a planted name.
 
-    The temporary file has a fresh random name opened with ``O_EXCL`` (``mkstemp``), so a symlink at
-    a guessable name is ignored and two processes writing the same file cannot collide.
+    The temporary file has a random name opened with ``O_EXCL`` and ``O_NOFOLLOW``, so a symlink at
+    a guessable name is ignored and two processes writing the same file cannot collide. Its mode
+    follows the umask like every downloaded file, so readers of the output directory can read it.
     """
-    descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=f"{_TEMP_PREFIX}{path.name}.", suffix=_TEMP_SUFFIX)
+    name = path.parent / f"{_TEMP_PREFIX}{path.name}.{secrets.token_hex(_TEMP_TOKEN_BYTES)}{_TEMP_SUFFIX}"
+    descriptor = os.open(name, _TEMP_FLAGS, _NEW_FILE_MODE)
     try:
         with os.fdopen(descriptor, "w", encoding=_ENCODING) as handle:
             handle.write(text)

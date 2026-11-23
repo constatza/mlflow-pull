@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 
 from mlflow.entities import Metric, Run
 from mlflow.exceptions import MlflowException
 
 from mlflow_pull.localfs import (
-    prepare_destination,
+    SizeMismatchError,
     ensure_directory,
+    is_plain_directory,
+    prepare_destination,
     read_small_text,
+    remove_stale_temp_files,
     stat_file,
     verified_download,
     write_atomically,
@@ -36,7 +41,7 @@ from mlflow_pull.plan import (
     parse_manifest,
     plan_run,
 )
-from mlflow_pull.ports import ArtifactDir, ArtifactFile, RunGateway
+from mlflow_pull.ports import ArtifactDir, ArtifactFile, RunGateway, UnsupportedEntry
 from mlflow_pull.render import record
 from mlflow_pull.resolve import resolve_experiments, resolve_runs
 from mlflow_pull.selection import FINISHED
@@ -52,13 +57,14 @@ class ListingLimitError(ValueError):
     """A run's artifact listing is deeper or larger than any real run's: a broken or hostile server."""
 
 
-def _list_files(gateway: RunGateway, run_id: str, path_filter: PathFilter) -> list[ArtifactFile]:
+def _list_files(gateway: RunGateway, run_id: str, path_filter: PathFilter) -> list[ArtifactFile | UnsupportedEntry]:
     """Walk the run's artifact listing, one call per directory, skipping directories no glob can reach.
 
     A directory is listed once however often it is named, and the walk stops at ``MAX_DEPTH`` levels
     and ``MAX_ENTRIES`` entries, so a server cannot keep it running or make it exponential.
+    An unsupported entry is kept to be counted; if it is a directory its subtree is never listed.
     """
-    files: list[ArtifactFile] = []
+    files: list[ArtifactFile | UnsupportedEntry] = []
     pending: list[RelPath | None] = [None]
     walked: set[RelPath] = set()
     entries = 0
@@ -73,7 +79,7 @@ def _list_files(gateway: RunGateway, run_id: str, path_filter: PathFilter) -> li
             if not entry.path.is_child_of(directory):  # also stops a server from looping the walk
                 raise UnsafePathError(f"run {run_id}: {entry.path} is not directly inside {directory or 'the run root'}")
             match entry:
-                case ArtifactFile():
+                case ArtifactFile() | UnsupportedEntry():
                     files.append(entry)
                 case ArtifactDir() if entry.path not in walked and path_filter.descends_into(entry.path):
                     walked.add(entry.path)
@@ -83,8 +89,14 @@ def _list_files(gateway: RunGateway, run_id: str, path_filter: PathFilter) -> li
     return files
 
 
-def _read_manifest(directory: Path) -> Recorded:
-    """The manifest of ``directory`` restricted to files still on disk with their recorded size and mtime."""
+def _read_manifest(root: Path, directory: Path) -> Recorded:
+    """The manifest of ``directory`` restricted to files still on disk with their recorded size and mtime.
+
+    Nothing is recorded in a directory that is, or lies below, a symlink: the files behind it are not
+    ours to vouch for, and ``execute`` refuses to write there.
+    """
+    if not is_plain_directory(root, directory):
+        return UNRECORDED
     text = read_small_text(directory / MANIFEST_NAME)
     recorded = UNRECORDED if text is None else parse_manifest(text)
     if isinstance(recorded, Unrecorded):
@@ -97,15 +109,15 @@ def _read_manifest(directory: Path) -> Recorded:
 
 
 def _plan_target(
-    gateway: RunGateway, target: RunTarget, nested: frozenset[str], options: PullOptions
+    gateway: RunGateway, root: Path, target: RunTarget, nested: frozenset[str], options: PullOptions
 ) -> RunPlan:
     content = options.content
     if content.artifacts:
         listing = _list_files(gateway, target.run.info.run_id, options.path_filter)
-        recorded = _read_manifest(target.dir)
+        recorded = _read_manifest(root, target.dir)
     else:
         listing, recorded = [], UNRECORDED
-    return plan_run(target, listing, recorded, options.path_filter, content.reserved, nested)
+    return plan_run(target, listing, recorded, options.path_filter, content.reserved, nested, options.fold_names)
 
 
 def plan_pull(
@@ -120,19 +132,50 @@ def plan_pull(
         require_within(resolution.root, target.dir)
     nested = nested_run_names(targets)
     with ThreadPoolExecutor(jobs) as pool:
-        runs = tuple(pool.map(lambda target: _plan_target(gateway, target, nested.get(target.dir, frozenset()), options), targets))
+        runs = tuple(
+            pool.map(
+                lambda target: _plan_target(gateway, resolution.root, target, nested.get(target.dir, frozenset()), options),
+                targets,
+            )
+        )
     return PullPlan(options.content, resolution.root, runs)
 
 
-def _fetch(gateway: RunGateway, root: Path, plan: RunPlan) -> Mapping[RelPath, OnDiskFile]:
-    """Download each planned file into its run directory and return what landed, as found on disk."""
+@dataclass(frozen=True, slots=True)
+class Landed:
+    """A downloaded file that is the size the server listed."""
+
+    path: RelPath
+    found: OnDiskFile
+
+
+@dataclass(frozen=True, slots=True)
+class ChangedDuringPull:
+    """A file of a run that was still running: it is not the size listed, because the run kept writing."""
+
+    path: RelPath
+
+
+def _fetch(gateway: RunGateway, root: Path, plan: RunPlan) -> Iterator[Landed | ChangedDuringPull]:
+    """Download each planned file into its run directory, yielding each as soon as it is verified.
+
+    A finished run does not change, so a wrong size is an error there; a running run may append
+    between the listing and the download, which is not.
+    """
     run_id, directory = plan.target.run.info.run_id, plan.target.dir
-    fetched: dict[RelPath, OnDiskFile] = {}
     for file in plan.files:
         prepare_destination(root, file.path.under(directory))
         gateway.download_artifact(run_id, file.path, directory)
-        fetched[file.path] = verified_download(directory, file)
-    return fetched
+        try:
+            yield Landed(file.path, verified_download(directory, file))
+        except SizeMismatchError:
+            if plan.run_status.terminal:
+                raise
+            yield ChangedDuringPull(file.path)
+
+
+def _save_manifest(plan: RunPlan, landed: dict[RelPath, OnDiskFile]) -> None:
+    write_atomically(plan.target.dir / MANIFEST_NAME, plan.record(landed).to_json())
 
 
 def _execute_run(gateway: RunGateway, root: Path, plan: RunPlan, content: Content) -> RunOutcome:
@@ -140,12 +183,26 @@ def _execute_run(gateway: RunGateway, root: Path, plan: RunPlan, content: Conten
     directory = plan.target.dir
     if plan.files or content.metadata:
         ensure_directory(root, directory)
-    fetched = _fetch(gateway, root, plan)
+        remove_stale_temp_files(directory)
+    landed: dict[RelPath, OnDiskFile] = {}
+    changed = 0
+    try:
+        for item in _fetch(gateway, root, plan):
+            match item:
+                case Landed(path, found):
+                    landed[path] = found
+                case ChangedDuringPull():
+                    changed += 1
+    except BaseException:
+        if landed:  # keep the progress: a re-pull then fetches only the rest
+            with contextlib.suppress(OSError):  # a failed save must not hide why the download failed
+                _save_manifest(plan, landed)
+        raise
     if plan.files:  # after the files, so an interrupted pull never vouches for a missing one
-        write_atomically(directory / MANIFEST_NAME, plan.record(fetched).to_json())
+        _save_manifest(plan, landed)
     if content.metadata:
         write_atomically(directory / SUMMARY_NAME, json.dumps(record(summarise_run(run, {})), indent=2))
-    return outcome_of(plan, content)
+    return outcome_of(plan, content, changed)
 
 
 def execute_plan(gateway: RunGateway, plan: PullPlan, jobs: int = DEFAULT_JOBS) -> tuple[RunOutcome, ...]:
