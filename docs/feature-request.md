@@ -1,6 +1,6 @@
 # mlpull feature requests
 
-Status: proposed, not implemented, except where an item says otherwise. Each item is generic MLflow client behaviour; none names a project, cluster or run layout.
+Status: items marked Done are implemented; the others are open. Each item is generic MLflow client behaviour; none names a project, cluster or run layout.
 
 ## Today
 
@@ -10,16 +10,16 @@ Gap seen when the tool is used by scripts: `run` takes ids only; `experiment` ca
 
 ## Deferred
 
-- `mlpull compare <run A> <run B>`: a caller can derive it from `mlpull runs --json`, so a separate command adds no capability yet.
-- `~/.config/mlpull/config.toml` with named servers: reading it needs `tomllib`, which is in the standard library only from Python 3.11, and the environment variables `MLPULL_SSH`, `MLPULL_REMOTE` and `MLPULL_OUT` already cover the common case.
+- `mlpull compare <run A> <run B>`: a caller can derive it from `mlpull runs --format json`, so a separate command adds no capability yet.
+- `~/.config/mlpull/config.toml` with named servers: the environment variables `MLPULL_SSH`, `MLPULL_REMOTE` and `MLPULL_OUT` already cover the common case.
 
 ## 1. Tunnel hardening
 
-Done: `ssh_command` passes `-o ControlMaster=no -o ControlPath=none`, so an existing ControlPersist master cannot adopt the forward. `--remote` accepts `host:port` and `MLPULL_REMOTE` provides a default, for tracking servers that listen on a port other than 5000.
+Done: `ssh_command` passes `-o ControlMaster=no -o ControlPath=none`, so an existing ControlPersist master cannot adopt the forward. SIGTERM closes the tunnel (the handler raises `SystemExit(143)` while it is open); only SIGKILL still orphans `ssh -N`. `--remote` accepts `host:port` and `MLPULL_REMOTE` provides a default, for tracking servers that listen on a port other than 5000.
 
 Deferred: `ServerAliveInterval` and `ServerAliveCountMax`. They detect a dead peer, not a dead parent, so they do not stop an orphaned `ssh -N` after `mlpull` is killed with SIGKILL. Another mechanism would be needed, and it is not worth the complexity yet.
 
-Not planned: a `ui` subcommand. Opening a server UI in a browser is generic transport and belongs to a managed forward (`rr fwd <name> --open`, see the rr request). mlpull stays MLflow-specific.
+Not planned: a `ui` subcommand. Opening a server UI in a browser is generic transport and belongs to a managed forward. mlpull stays MLflow-specific.
 
 ## 2. Client and server version matrix
 
@@ -35,7 +35,7 @@ Not needed today: the servers used with mlpull have no passwords, so nothing is 
 
 ## Breaking changes
 
-Exit code 3 for "nothing matched" replaced exit 0 when `run`, `experiment` or `runs` found no run, and an `experiment` or `runs` glob that matches no experiment now exits 3 instead of 1. All other additions are new options or commands; defaults of `run` and `experiment` stay.
+`run`, `experiment` and `runs` exit 3 when nothing matched, including an experiment glob that matches no experiment; a plain experiment name or id that does not exist exits 1. All other additions are new options or commands; defaults of `run` and `experiment` stay.
 
 ## Suggested order
 
