@@ -80,7 +80,7 @@ mlpull runs [options]                       # read-only summary of runs: metrics
 mlpull run --help                           # every option
 ```
 
-Options go after the command. `-o` / `--out` sets the destination (env `MLPULL_OUT`, default `./mlflow-downloads`); `-j N` downloads N run trees in parallel (default 4).
+Options go after the command. `-o` / `--out` sets the destination (env `MLPULL_OUT`, default `./mlflow-downloads`); `-j N` downloads N run trees in parallel (default 4). A run named twice (`run A A`) is downloaded once; a run named beside its parent (`run PARENT CHILD`) lands in both places, the top level and inside the parent, and the two copies are downloaded independently.
 
 ### Run status
 
@@ -128,7 +128,7 @@ By default every artifact of every selected run is fetched. These options on `ru
 | option | effect |
 |---|---|
 | `--path GLOB` | Only artifacts whose path matches GLOB. Repeatable; `!GLOB` excludes, and an exclude beats every include. Without `--path` every artifact is taken. |
-| `--max-size SIZE` | Refuse, before writing anything, when the files to fetch add up to more than SIZE. Exit code 1. |
+| `--max-size SIZE` | Refuse, before downloading anything (apart from the short-lived case probe described under Safety of downloads), when the files to fetch add up to more than SIZE. Exit code 1. |
 | `--dry-run` | Print, per run, the files that would be fetched with their sizes and the totals, and write nothing, not even directories. Applies `--max-size` too: exit code 0, or 1 when the download would be refused. |
 | `--what LIST` | What to pull per run: any of `metrics`, `params`, `tags`, `artifacts`, as a comma list or repeated. Default `artifacts`. |
 | `--format text\|jsonl` | `text` (default) prints for people. `jsonl` prints one JSON record per run on stdout and every note on stderr; see Output and exit codes. |
@@ -155,7 +155,7 @@ On the next pull a file is skipped when the manifest records it, the server stil
 
 There is no content hash. A file that was replaced by one of the same size and the same modification time (for example restored with `cp -p`) is taken for the recorded one; delete it or the manifest to refetch.
 
-The manifest and `run.json` are written at the root of the run directory. An artifact that is one of those names, or lies below a directory of that name (`.mlpull.json/x`), would collide, and so would one below the directory of a nested run of the same run (`child-1a2b3c4d/...`), so the pull stops with an error before writing anything; leave the artifact out with `--path '!.mlpull.json'` (or `'!run.json'`, or the artifact's own path). Artifacts of that name in subdirectories are fine. The same check stops two artifacts that are one file on the target (`é` composed and decomposed everywhere; on Windows and macOS, which fold case, also `A.txt` and `a.txt`, and the reserved names match in any case there, while on Linux `Model.pkl` and `model.pkl` are two files), and a file that is also the directory of another artifact (`a` and `a/b`). Each of these errors names the `--path '!NAME'` that leaves one of the artifacts out.
+The manifest and `run.json` are written at the root of the run directory. An artifact that is one of those names, or lies below a directory of that name (`.mlpull.json/x`), would collide, and so would one below the directory of a nested run of the same run (`child-1a2b3c4d/...`), so the pull stops with an error before writing anything; leave the artifact out with `--path '!.mlpull.json'` (or `'!run.json'`, or the artifact's own path). Artifacts of that name in subdirectories are fine. The same check stops two artifacts that are one file on the target (`é` composed and decomposed everywhere; where the output directory's file system ignores case, also `A.txt` and `a.txt`, and the reserved names match in any case there, while where it keeps case `Model.pkl` and `model.pkl` are two files). mlpull asks the output directory's file system, not the platform: before planning it creates a probe file with a mixed-case name in the output directory (in its nearest existing parent when it does not exist yet), looks the file up under the swapped spelling and removes it, so a WSL drive, vfat, exFAT or an SMB share on Linux counts as ignoring case and a case-sensitive volume on macOS or Windows as keeping it. `--dry-run` writes no probe: it looks up a name already in that directory the same way, and uses the platform's usual answer (Windows and macOS ignore case, Linux keeps it) when nothing is there to look up. A crash between creating and removing the probe leaves one hidden file named `.mlpull-CaSe-probe.<hex>.tmp` there; delete it by hand. The check also stops a file that is also the directory of another artifact (`a` and `a/b`). Each of these errors names the `--path '!NAME'` that leaves one of the artifacts out.
 
 ### Safety of downloads
 
@@ -173,7 +173,7 @@ The final line reads `Downloaded N run(s), M file(s), SIZE to <dir> (K run(s) al
 
 ## Output and exit codes
 
-`run` and `experiment` print for people by default: skipped runs and refusals on stderr, and a last line on stdout. `--format jsonl` is for scripts: stdout carries only JSON lines, one per run, and every human note (skipped runs, refusals, the summary line, and the file listing of `--dry-run`) goes to stderr. In every human line (the notes, the `--dry-run` listing, error messages and the `runs` text and `md-table` formats) a character that could drive the terminal, such as a control character or a bidi override in a run or artifact name, is shown as an escape like `\x9b` or `\u202e`; JSON and jsonl output keep names exactly.
+`run` and `experiment` print for people by default: skipped runs and refusals on stderr, and a last line on stdout. `--format jsonl` is for scripts: stdout carries only JSON lines, one per run, and every human note (skipped runs, refusals, the summary line, and the file listing of `--dry-run`) goes to stderr. In every human line (the notes, the `--dry-run` listing, error messages, including what a remote SSH host prints when the tunnel fails, and the `runs` text and `md-table` formats) a character that could drive the terminal, such as a control character or a bidi override in a run or artifact name, is shown as an escape like `\x9b` or `\u202e`, and a message of several lines (MLflow reports a failed download that way) is joined into one line with ` | ` between the lines; JSON and jsonl output keep names exactly.
 
 ```sh
 mlpull run <run_id> --format jsonl 2>/dev/null | jq -r 'select(.outcome == "downloaded") | .dir'
