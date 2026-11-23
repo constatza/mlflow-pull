@@ -5,7 +5,7 @@ description = "Download the artifacts of an MLflow run, its nested runs, or a wh
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "mlflow-skinny>=2.10",
+    "mlflow-skinny>=3.7",
     "typer>=0.29.1",
 ]
 
@@ -13,7 +13,11 @@ dependencies = [
 mlpull = "mlflow_pull:app"
 
 [dependency-groups]
-dev = ["mlflow>=2.10", "pytest>=8"]
+dev = ["mlflow[auth]>=3.7", "pytest>=8"]
+
+[tool.pytest.ini_options]
+markers = ["slow: starts a real mlflow server"]
+addopts = "-m 'not slow'"
 
 [build-system]
 requires = ["hatchling"]

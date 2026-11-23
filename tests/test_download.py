@@ -8,13 +8,15 @@ from pathlib import Path
 
 import pytest
 from mlflow.tracking import MlflowClient
-from typer.testing import CliRunner
 
+from mlflow_pull.plan import MANIFEST_NAME
 from mlflow_pull import (
     PARENT_RUN_TAG,
+    RemoteAddr,
+    RunGateway,
     RunStatusError,
+    SshHost,
     allowed_statuses,
-    app,
     build_filter,
     download_experiments,
     download_runs,
@@ -24,11 +26,6 @@ from mlflow_pull import (
 )
 
 EVERY_STATUS = allowed_statuses(unfinished=True, failed=True)
-
-
-@pytest.fixture
-def client(tmp_path: Path) -> MlflowClient:
-    return MlflowClient(tracking_uri=f"sqlite:///{tmp_path / 'mlflow.db'}")
 
 
 @pytest.fixture
@@ -69,17 +66,17 @@ def tree(client: MlflowClient, tmp_path: Path) -> dict[str, str]:
 
 
 def _files(root: Path) -> list[str]:
-    return sorted(p.name for p in root.rglob("*") if p.is_file())
+    return sorted(p.name for p in root.rglob("*") if p.is_file() and p.name != MANIFEST_NAME)
 
 
 # --- download_runs -------------------------------------------------------------
 
 
 def test_run_tree_keeps_layout_and_skips_failed_child(
-    client: MlflowClient, tree: dict[str, str], tmp_path: Path
+    gateway: RunGateway, tree: dict[str, str], tmp_path: Path
 ) -> None:
     out = tmp_path / "out"
-    count = download_runs(client, [tree["parent"]], out)
+    count = download_runs(gateway, [tree["parent"]], out)
 
     parent_dir = out / f"parent-{tree['parent'][:8]}"
     assert count == 3
@@ -89,26 +86,26 @@ def test_run_tree_keeps_layout_and_skips_failed_child(
 
 
 def test_run_tree_with_every_status_includes_failed_child(
-    client: MlflowClient, tree: dict[str, str], tmp_path: Path
+    gateway: RunGateway, tree: dict[str, str], tmp_path: Path
 ) -> None:
-    assert download_runs(client, [tree["parent"]], tmp_path / "out", EVERY_STATUS) == 4
+    assert download_runs(gateway, [tree["parent"]], tmp_path / "out", EVERY_STATUS) == 4
     assert "b.txt" in _files(tmp_path / "out")
 
 
 def test_unfinished_named_run_is_refused_before_any_download(
-    client: MlflowClient, tree: dict[str, str], tmp_path: Path
+    gateway: RunGateway, tree: dict[str, str], tmp_path: Path
 ) -> None:
     out = tmp_path / "out"
     with pytest.raises(RunStatusError, match="RUNNING"):
-        download_runs(client, [tree["other"], tree["live"]], out)
+        download_runs(gateway, [tree["other"], tree["live"]], out)
     assert not out.exists()
 
 
 def test_several_runs_in_parallel(
-    client: MlflowClient, tree: dict[str, str], tmp_path: Path
+    gateway: RunGateway, tree: dict[str, str], tmp_path: Path
 ) -> None:
     out = tmp_path / "out"
-    assert download_runs(client, [tree["parent"], tree["other"]], out, jobs=2) == 4
+    assert download_runs(gateway, [tree["parent"], tree["other"]], out, jobs=2) == 4
     assert "o.txt" in _files(out)
 
 
@@ -116,25 +113,25 @@ def test_several_runs_in_parallel(
 
 
 def test_experiment_skips_unfinished_and_failed_runs(
-    client: MlflowClient, tree: dict[str, str], tmp_path: Path
+    gateway: RunGateway, tree: dict[str, str], tmp_path: Path
 ) -> None:
     out = tmp_path / "out"
-    assert download_experiments(client, ["exp"], out) == 4
+    assert download_experiments(gateway, ["exp"], out) == 4
     assert _files(out) == ["a.txt", "deep.txt", "g.txt", "o.txt", "top.txt"]
 
 
 def test_experiment_with_every_status(
-    client: MlflowClient, tree: dict[str, str], tmp_path: Path
+    gateway: RunGateway, tree: dict[str, str], tmp_path: Path
 ) -> None:
-    assert download_experiments(client, ["exp"], tmp_path / "out", EVERY_STATUS) == 6
+    assert download_experiments(gateway, ["exp"], tmp_path / "out", EVERY_STATUS) == 6
 
 
 def test_tag_filter_picks_nested_match_once_with_its_subtree(
-    client: MlflowClient, tree: dict[str, str], tmp_path: Path
+    gateway: RunGateway, tree: dict[str, str], tmp_path: Path
 ) -> None:
     out = tmp_path / "out"
     count = download_experiments(
-        client, ["exp"], out, filter_string=build_filter(tags=[("phase", "report")])
+        gateway, ["exp"], out, filter_string=build_filter(tags=[("phase", "report")])
     )
 
     child_dir = out / "exp" / f"child_a-{tree['child_a'][:8]}"
@@ -143,34 +140,34 @@ def test_tag_filter_picks_nested_match_once_with_its_subtree(
     assert _files(out) == ["a.txt", "g.txt"]
 
 
-def test_param_filter(client: MlflowClient, tree: dict[str, str], tmp_path: Path) -> None:
+def test_param_filter(gateway: RunGateway, tree: dict[str, str], tmp_path: Path) -> None:
     out = tmp_path / "out"
     filter_string = build_filter(params=[("lr", "0.1")])
-    assert download_experiments(client, ["exp"], out, filter_string=filter_string) == 1
+    assert download_experiments(gateway, ["exp"], out, filter_string=filter_string) == 1
     assert _files(out) == ["o.txt"]
 
 
 def test_since_in_the_future_selects_nothing(
-    client: MlflowClient, tree: dict[str, str], tmp_path: Path
+    gateway: RunGateway, tree: dict[str, str], tmp_path: Path
 ) -> None:
     tomorrow = datetime.now(timezone.utc) + timedelta(days=1)
     filter_string = build_filter(since=tomorrow)
-    assert download_experiments(client, ["exp"], tmp_path / "out", filter_string=filter_string) == 0
+    assert download_experiments(gateway, ["exp"], tmp_path / "out", filter_string=filter_string) == 0
 
 
 def test_experiment_glob_matches_several(
-    client: MlflowClient, tree: dict[str, str], tmp_path: Path
+    gateway: RunGateway, tree: dict[str, str], tmp_path: Path
 ) -> None:
     out = tmp_path / "out"
-    assert download_experiments(client, ["exp*"], out) == 5
+    assert download_experiments(gateway, ["exp*"], out) == 5
     assert {p.name for p in out.iterdir()} == {"exp", "exp-two"}
 
 
 def test_experiment_glob_without_match_is_an_error(
-    client: MlflowClient, tree: dict[str, str], tmp_path: Path
+    gateway: RunGateway, tree: dict[str, str], tmp_path: Path
 ) -> None:
     with pytest.raises(ValueError, match="no experiment"):
-        download_experiments(client, ["nothing*"], tmp_path / "out")
+        download_experiments(gateway, ["nothing*"], tmp_path / "out")
 
 
 # --- filter building -------------------------------------------------------------
@@ -205,14 +202,6 @@ def test_parse_when_relative_and_iso() -> None:
 
 
 # --- CLI -----------------------------------------------------------------------------
-
-
-@pytest.fixture
-def cli(client: MlflowClient, monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("MLFLOW_TRACKING_URI", client.tracking_uri)
-    monkeypatch.delenv("MLPULL_SSH", raising=False)
-    monkeypatch.delenv("MLPULL_OUT", raising=False)
-    return lambda *args: CliRunner().invoke(app, list(args))
 
 
 def test_cli_run_with_out_option(cli, tree: dict[str, str], tmp_path: Path) -> None:
@@ -288,20 +277,20 @@ def fake_ssh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 def test_ssh_command_forwards_local_port() -> None:
-    cmd = ssh_command("test.invalid", "localhost:5000", 5055)
+    cmd = ssh_command(SshHost("test.invalid"), RemoteAddr("localhost", 5000), 5055)
 
-    assert cmd[0] == "ssh" and cmd[-1] == "test.invalid"
+    assert cmd[0] == "ssh" and cmd[-1] == "test.invalid" and cmd[-2] == "--"
     assert cmd[cmd.index("-L") + 1] == "127.0.0.1:5055:localhost:5000"
     assert "ExitOnForwardFailure=yes" in cmd and "BatchMode=yes" in cmd
     assert "-C" not in cmd
-    assert "-C" in ssh_command("test.invalid", "localhost:5000", 5055, compress=True)
+    assert "-C" in ssh_command(SshHost("test.invalid"), RemoteAddr("localhost", 5000), 5055, compress=True)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="fake ssh is a shebang script")
 def test_tunnel_opens_and_closes(fake_ssh) -> None:
     fake_ssh(_FAKE_SSH_LISTEN)
 
-    with ssh_tunnel("test.invalid") as uri:
+    with ssh_tunnel(SshHost("test.invalid")) as uri:
         host, port = uri.removeprefix("http://").split(":")
         socket.create_connection((host, int(port)), 1).close()
 
@@ -314,5 +303,5 @@ def test_tunnel_reports_ssh_failure(fake_ssh) -> None:
     fake_ssh(_FAKE_SSH_FAIL)
 
     with pytest.raises(SystemExit, match="Permission denied"):
-        with ssh_tunnel("test.invalid"):
+        with ssh_tunnel(SshHost("test.invalid")):
             pass

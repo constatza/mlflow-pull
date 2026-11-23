@@ -2,3 +2,9 @@
 __pycache__/
 *.egg-info/
 mlflow-downloads/
+mlruns/
+mlflow.db
+.env
+dist/
+build/
+.pytest_cache/
